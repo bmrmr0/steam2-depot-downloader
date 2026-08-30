@@ -45,7 +45,11 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "steam2 downloader"
 DEFAULT_BASE = ""        # set it in the Server field; remembered after that
-UA = "steam2-downloader/1.0 (python-stdlib)"
+# Mirrors have been seen rejecting "name-with-hyphen/version" user agents with
+# a 403, while serving curl, browsers and this plainer wording perfectly well.
+# It still says exactly what the client is - change it if your mirror prefers
+# something else.
+UA = "steam2 depot downloader (python, stdlib)"
 TIMEOUT = 90          # the server can take 25s+ to answer a cold request
 CHUNK = 1 << 18          # 256 KiB
 MAX_ROWS = 3000          # max rows rendered in the browse list at once
@@ -304,6 +308,9 @@ class Downloader:
     def __init__(self):
         self.jobs = []
         self.q = queue.Queue()
+        # mirror downloads jump the line: they hold a torrent paused while they
+        # run, so they must not wait behind a restored queue of 500 files
+        self.urgent = queue.Queue()
         self.lock = threading.Lock()
         self.dirty = set()                    # indices of jobs whose row changed
         self.running = False
@@ -317,14 +324,15 @@ class Downloader:
         self.retries = 4
 
     # ---- queue management
-    def add(self, jobs):
+    def add(self, jobs, urgent: bool = False):
         with self.lock:
             base = len(self.jobs)
             self.jobs.extend(jobs)
             for i in range(len(jobs)):
                 self.dirty.add(base + i)
+        lane = self.urgent if urgent else self.q
         for j in jobs:
-            self.q.put(j)
+            lane.put(j)
         if self.running:
             self._ensure_workers()
 
@@ -400,9 +408,12 @@ class Downloader:
         while not self.stop_flag:
             self._wait_if_paused()
             try:
-                job = self.q.get(timeout=0.5)
+                job = self.urgent.get_nowait()          # line-jumpers first
             except queue.Empty:
-                break
+                try:
+                    job = self.q.get(timeout=0.5)
+                except queue.Empty:
+                    break
             if self.stop_flag:
                 job.status = STATUS_STOP
                 self.mark(job)
@@ -1018,6 +1029,17 @@ class QBit:
         if st != 200:
             raise QBitError(f"filePrio returned HTTP {st} {body[:80]!r}")
 
+    def pause(self, thash: str):
+        # qBittorrent 5.x renamed pause -> stop; try both
+        for path in ("/api/v2/torrents/pause", "/api/v2/torrents/stop"):
+            try:
+                st, _, _ = self._req(path, {"hashes": thash})
+                if st == 200:
+                    return True
+            except QBitError:
+                continue
+        return False
+
     def resume(self, thash: str):
         # qBittorrent 5.x renamed resume -> start; try both
         for path in ("/api/v2/torrents/resume", "/api/v2/torrents/start"):
@@ -1137,6 +1159,11 @@ class App(tk.Tk):
         self.qb_auto_var = tk.BooleanVar(value=True)
         self.qb_tor_var = tk.StringVar()
         self.qb_status_var = tk.StringVar(value="not connected")
+        self.mirror_rows = []                 # incomplete files the torrent wants
+        self.mirror_job = None                # an HTTP mirror run in progress
+        self.mirror_pause_var = tk.BooleanVar(value=True)
+        self.mirror_skip_var = tk.BooleanVar(value=False)
+        self.mirror_status_var = tk.StringVar(value="not connected to qBittorrent")
         # remembered from the last session so the depot list knows where the
         # torrent lives before qBittorrent is connected. Never written to.
         self.torrent_dir_var = tk.StringVar()
@@ -1266,6 +1293,7 @@ class App(tk.Tk):
         self._build_depot(nb)
         self._build_extract(nb)
         self._build_qbit(nb)
+        self._build_mirror(nb)
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._build_queue(main)
 
@@ -1561,6 +1589,57 @@ class App(tk.Tk):
         self.qb_txt.pack(side="left", fill="both", expand=True)
         qsb.pack(side="left", fill="y")
 
+    def _build_mirror(self, nb):
+        """Files the torrent is still missing, fetchable straight from the server."""
+        f = ttk.Frame(nb, padding=6)
+        nb.add(f, text="Mirror")
+        self.mirror_tab = f
+
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Button(row, text="Refresh", command=self._mirror_refresh).pack(side="left")
+        self.btn_mirror = ttk.Button(row, text="Download selected from server",
+                                     command=self._mirror_download)
+        self.btn_mirror.pack(side="left", padx=6)
+        ttk.Button(row, text="Select all",
+                   command=lambda: self.mtv.selection_set(
+                       *self.mtv.get_children())).pack(side="left")
+        ttk.Label(row, textvariable=self.mirror_status_var,
+                  foreground="#0b57d0").pack(side="left", padx=12)
+
+        opts = ttk.Frame(f)
+        opts.pack(fill="x", pady=(0, 6))
+        ttk.Checkbutton(opts, text="pause the torrent while downloading, resume when done",
+                        variable=self.mirror_pause_var).pack(anchor="w")
+        ttk.Checkbutton(
+            opts, variable=self.mirror_skip_var,
+            text=("after mirroring, set those files to \"do not download\" in "
+                  "qBittorrent (stops it fetching them a second time - but the "
+                  "torrent then stays incomplete for seeding)")).pack(anchor="w")
+
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True)
+        cols = ("name", "depot", "size", "got", "left", "prio")
+        heads = {"name": "File", "depot": "Depot", "size": "Size",
+                 "got": "Downloaded", "left": "Remaining", "prio": "Priority"}
+        self.mtv = ttk.Treeview(body, columns=cols, show="headings",
+                                selectmode="extended")
+        for c, w, a in (("name", 460, "w"), ("depot", 80, "e"), ("size", 100, "e"),
+                        ("got", 100, "e"), ("left", 100, "e"), ("prio", 90, "w")):
+            self.mtv.heading(c, text=heads[c])
+            self.mtv.column(c, width=w, anchor=a, stretch=(c == "name"))
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.mtv.yview)
+        self.mtv.configure(yscrollcommand=sb.set)
+        self.mtv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+
+        ttk.Label(f, foreground="#555", wraplength=980, justify="left",
+                  text=("Everything qBittorrent has queued but not finished. Pick "
+                        "the ones you don't want to wait for and pull them from the "
+                        "server instead - they land in your download folder, which "
+                        "the extractor reads alongside the torrent's. The torrent "
+                        "folder is never written to.")).pack(anchor="w", pady=(6, 0))
+
     def _build_queue(self, parent):
         f = ttk.Frame(parent, padding=(6, 4))
         parent.add(f, weight=2)
@@ -1721,20 +1800,24 @@ class App(tk.Tk):
                    rel=os.path.join(*[safe_name(p) for p in local.split("/")]),
                    size=size, sha256=m.group(4).lower() if m else "")
 
-    def _enqueue(self, jobs):
+    def _enqueue(self, jobs, urgent: bool = False):
+        """Queue these. Returns the job objects now being tracked, which for a
+        file already in the queue is the existing one, not the new copy."""
         if not jobs:
-            return
+            return []
         if not self._writable_save_dir():      # never write into the torrent folder
-            return
-        have = {j.url for j in self.dl.jobs}
-        jobs = [j for j in jobs if j.url not in have]
-        if not jobs:
+            return []
+        have = {j.url: j for j in self.dl.jobs}
+        tracked = [have.get(j.url) or j for j in jobs]
+        fresh = [j for j in jobs if j.url not in have]
+        if not fresh:
             self.status_var.set("everything selected is already in the queue")
-            return
-        self.dl.add(jobs)
+            return tracked
+        self.dl.add(fresh, urgent)
         self._sync_queue_rows()
         self.status_var.set(
-            f"queued {len(jobs):,} files ({human(sum(j.size for j in jobs))})")
+            f"queued {len(fresh):,} files ({human(sum(j.size for j in fresh))})")
+        return tracked
 
     def _add_selected(self):
         sel = [self.filtered[int(i)] for i in self.tv.selection()]
@@ -1776,6 +1859,8 @@ class App(tk.Tk):
         if cur is getattr(self, "depots_tab", None) and self.depot_stats:
             self._show_depots()                      # paint now with what we know
             self._refresh_local()                    # recount in the background
+        elif cur is getattr(self, "mirror_tab", None) and not self.mirror_job:
+            self._mirror_refresh()
 
     # ---- depot index
     def _load_depots(self, refresh: bool = False):
@@ -2623,6 +2708,140 @@ class App(tk.Tk):
                          f"({human(sum(j.size for j in jobs))}) over HTTP?"):
                 self._enqueue(jobs)
         self._depot_entries(deps, got)
+
+    # ---- mirror: pull what the torrent hasn't finished straight from the server
+    def _mirror_refresh(self, note: str = ""):
+        """note survives the refresh, so the result of a run isn't wiped by the
+        file count that lands a second later."""
+        self._mirror_note = note
+        if not (self.qb and self.qb_hash):
+            self.mirror_status_var.set("connect to qBittorrent first")
+            return
+        self.mirror_status_var.set("reading the torrent's file list ...")
+
+        def work():
+            try:
+                files = self.qb.files(self.qb_hash)
+            except QBitError as exc:
+                self.after(0, lambda e=exc: self.mirror_status_var.set(f"error: {e}"))
+                return
+            self.after(0, lambda: self._mirror_fill(files))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mirror_fill(self, files):
+        """Everything qBittorrent means to download but hasn't finished."""
+        rows = [f for f in files
+                if f.get("progress", 0) < 1 and f.get("priority", 0) > 0]
+        rows.sort(key=lambda f: Path(f["name"].replace("\\", "/")).name)
+        self.mirror_rows = rows
+        self.qb_index.update({Path(f["name"].replace("\\", "/")).name: f
+                              for f in files})
+        self.mtv.delete(*self.mtv.get_children())
+        label = {QBit.PRIO_SKIP: "skip", QBit.PRIO_NORMAL: "normal",
+                 QBit.PRIO_HIGH: "high", QBit.PRIO_MAX: "maximum"}
+        left = 0
+        for i, f in enumerate(rows):
+            n = Path(f["name"].replace("\\", "/")).name
+            m = NAME_RE.match(n)
+            size, prog = f.get("size", 0), f.get("progress", 0)
+            left += size - size * prog
+            self.mtv.insert("", "end", iid=str(i), values=(
+                n, m.group(1) if m else "-", human(size), f"{prog * 100:.0f}%",
+                human(size - size * prog),
+                label.get(f.get("priority"), f.get("priority"))))
+        msg = f"{len(rows):,} unfinished files, {human(left)} still to fetch"
+        if getattr(self, "_mirror_note", ""):
+            msg = f"{self._mirror_note}  |  {msg}"
+            self._mirror_note = ""
+        self.mirror_status_var.set(msg)
+
+    def _mirror_download(self):
+        if self.mirror_job:
+            messagebox.showinfo(APP_NAME, "A mirror download is already running.")
+            return
+        try:
+            sel = [self.mirror_rows[int(i)] for i in self.mtv.selection()]
+        except (ValueError, IndexError):
+            sel = []
+        if not sel:
+            self.mirror_status_var.set("select some files first")
+            return
+        if not self._need_base() or not self._writable_save_dir():
+            return
+        jobs = []
+        for f in sel:
+            n = Path(f["name"].replace("\\", "/")).name
+            kind = ("blobs" if n.endswith(".blob") else
+                    "dats" if n.endswith(".dat") else "")
+            if kind:
+                jobs.append(self._job_for(kind, n, f.get("size", 0)))
+        if not jobs:
+            self.mirror_status_var.set("none of those are blobs or dats")
+            return
+        total = sum(j.size for j in jobs)
+        if not self._ask(f"Fetch {len(jobs)} file(s) ({human(total)}) from the "
+                         f"server instead of waiting for the torrent?"):
+            return
+        if not self._space_ok(total):
+            return
+
+        paused = False
+        if self.mirror_pause_var.get():
+            try:
+                paused = self.qb.pause(self.qb_hash)
+            except QBitError as exc:
+                self._qb_log(f"could not pause the torrent: {exc}")
+            self._qb_log("torrent paused for the mirror download" if paused else
+                         "could not pause the torrent - carrying on anyway")
+        # track whatever the queue actually holds for these URLs, and let them
+        # jump ahead of any backlog - the torrent is paused until they finish
+        self.mirror_job = {"jobs": self._enqueue(jobs, urgent=True) or jobs,
+                           "paused": paused}
+        self._start()
+        self.btn_mirror.config(state="disabled")
+        self.mirror_status_var.set(
+            f"downloading {len(jobs)} file(s), {human(total)} ...")
+        self._mirror_poll()
+
+    def _mirror_poll(self):
+        if not self.mirror_job:
+            return
+        jobs = self.mirror_job["jobs"]
+        if any(j.status in (STATUS_QUEUED, STATUS_ACTIVE) for j in jobs):
+            self.after(1000, self._mirror_poll)
+            return
+        self._mirror_finished()
+
+    def _mirror_finished(self):
+        job, self.mirror_job = self.mirror_job, None
+        self.btn_mirror.config(state="normal")
+        done = [j for j in job["jobs"] if j.status in (STATUS_DONE, STATUS_SKIP)]
+        msg = f"mirrored {len(done)}/{len(job['jobs'])} file(s)"
+        if len(done) < len(job["jobs"]):
+            msg += f", {len(job['jobs']) - len(done)} failed"
+        self._local_cache = None
+
+        if done and self.mirror_skip_var.get() and self.qb and self.qb_hash:
+            ids = [self.qb_index[n]["index"]
+                   for n in (Path(j.rel).name for j in done)
+                   if n in self.qb_index]
+            try:
+                self.qb.set_priority(self.qb_hash, ids, QBit.PRIO_SKIP)
+                self._qb_log(f"set {len(ids)} mirrored file(s) to 'do not download'")
+                msg += f", {len(ids)} now skipped in qBittorrent"
+            except QBitError as exc:
+                self._qb_log(f"could not change priorities: {exc}")
+
+        if job["paused"]:
+            try:
+                self.qb.resume(self.qb_hash)
+                self._qb_log("torrent resumed")
+                msg += ", torrent resumed"
+            except QBitError as exc:
+                self._qb_log(f"could NOT resume the torrent: {exc}")
+                msg += " - COULD NOT RESUME THE TORRENT, do it in qBittorrent"
+        self._log(msg)
+        self._mirror_refresh(msg)
 
     def _qb_torrent_dirs(self):
         """Locate the torrent's blobs/ and dats/ folders on disk."""
@@ -3525,6 +3744,12 @@ class App(tk.Tk):
             self.status_var.set(f"restored {len(jobs)} unfinished downloads - press Start")
 
     def _on_close(self):
+        # never leave a torrent paused because the app went away mid-mirror
+        if self.mirror_job and self.mirror_job.get("paused") and self.qb:
+            try:
+                self.qb.resume(self.qb_hash)
+            except Exception:                                       # noqa: BLE001
+                pass
         self.dl.stop()
         self.ext.kill()
         self._save_settings()

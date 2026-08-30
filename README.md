@@ -52,6 +52,17 @@ about broken chains (no v0, a missing version, a version with only half a pair).
 **Extract** — depot, version, CRC, an optional regex filter, output folder. The
 extractor's output streams into the log.
 
+**Mirror** — every file qBittorrent has queued but not finished, with size,
+progress and how much is left. Select any number and pull them straight from the
+server instead of waiting for peers. The torrent is paused for the duration and
+resumed when the downloads finish (and resumed too if you close the app
+mid-run). Mirrored files land in your download folder, which the extractor reads
+alongside the torrent's, so nothing is written into the torrent folder.
+
+Optionally — off by default — mirrored files can be set to *do not download* in
+qBittorrent afterwards, so it doesn't fetch them a second time. That leaves the
+torrent permanently incomplete, so it's off unless you tick it.
+
 **Queue** — Start/Pause/Stop, resumable via HTTP Range. *Verify on disk*
 re-hashes against the sha256 in each filename. *Restore dates* applies the
 server's original timestamps from `blobs_dates.txt` / `dats_dates.txt`.
