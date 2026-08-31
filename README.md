@@ -20,10 +20,10 @@ Everything — settings, cache, folders — is created on first run.
 
 ## Quick start
 
-1. Put the archive address in **Server**, and set **Save to** — both in the top
-   bar, both remembered. If you use the torrent, *Save to* must be a *different*
-   folder from the torrent's (see [Folders](#folders)).
-2. **Depots** → *Load depot list* → *Fetch names from Steam* (once).
+1. A fresh install opens on **Settings**: pick the mirror and the folders, then
+   press Save. If you use the torrent, *Save to* must be a *different* folder
+   from the torrent's (see [Folders](#folders)).
+2. **Depots** builds itself on startup; press *Fetch names from Steam* once.
 3. Right-click a depot → **Download + extract**.
 
 It works out which blobs and dats it needs, skips what you have, fetches the
@@ -32,41 +32,115 @@ extractor if missing, and runs it with the right arguments — including
 
 ## The tabs
 
-**Depots** — all 10,876, with sizes, version counts and **You have** as a
-completion percentage counting both your folder and the torrent's. Sort by any
+**Depots** — all 10,876, built from the server's own file lists when the app
+starts, with sizes, version counts and **You have** as a completion percentage
+counting both your folder and the torrent's. Sort by any
 column; **Find** takes text or `have:complete` / `partial` / `none` /
 `extracted`. Already-extracted depots are tinted green.
 
 Right-click one (or several): open in picker · preview file list · download +
 extract (several run in turn) · send to qBittorrent, all or only what's missing ·
-queue over HTTP · open extracted output · copy ids.
+queue over HTTP · open extracted output · copy ids · delete its dats.
+
+**Delete this depot's dats** reclaims the space once you have extracted a depot.
+The dats are the entire weight of it; the blobs are kilobytes and hold the
+manifest, so they are kept and the depot stays listed and previewable. Every dat
+of that depot is set to *do not download* in the torrent first - otherwise
+qBittorrent would simply fetch it again - and the torrent is stopped while the
+files go, since Windows will not delete a file qBittorrent still holds open. It
+is started again only if it was running to begin with. The files are removed
+from your folder and the torrent's alike. It is the one thing that deletes
+anything in the torrent folder, so it always asks first, even in unattended
+mode, and anything qBittorrent still holds open is reported rather than silently
+skipped.
 
 **Browse** — the raw server index, cached locally. The filter box takes `852_`,
 `depot:852` for exact ids, or a regex. *Add ALL filtered* queues the whole match
 set, not just the visible rows.
 
 **Depot picker** — one row per version with its blob CRC, sizes, and whether you
-hold that version's blob, dat, both or neither. Banners warn about resets and
-about broken chains (no v0, a missing version, a version with only half a pair).
+hold that version's blob, dat, both or neither. **Select a version and press
+Download + extract and you get that version**, not the newest: the *version* box
+follows whatever row you pick, and the chain 0…N is fetched to build it.
+Banners warn about resets and about broken chains (no v0, a missing version, a
+version with only half a pair).
 
 **Extract** — depot, version, CRC, an optional regex filter, output folder. The
 extractor's output streams into the log.
 
-**Mirror** — every file qBittorrent has queued but not finished, with size,
-progress and how much is left. Select any number and pull them straight from the
-server instead of waiting for peers. The torrent is paused for the duration and
-resumed when the downloads finish (and resumed too if you close the app
-mid-run). Mirrored files land in your download folder, which the extractor reads
-alongside the torrent's, so nothing is written into the torrent folder.
+Extractions and processing runs share one **task queue**, shown on this tab: add
+as many as you like, from here, from the picker or from the Process tab, and
+they run one after another rather than refusing while something else is busy.
+Remove queued jobs from the list; *Stop* ends the running one and drops the
+rest.
 
-Optionally — off by default — mirrored files can be set to *do not download* in
-qBittorrent afterwards, so it doesn't fetch them a second time. That leaves the
-torrent permanently incomplete, so it's off unless you tick it.
+**Mirror** — every file qBittorrent has queued but not finished, with size, a
+progress bar and how much is left. Sort by any column; **Select untouched (0%)**
+grabs everything the torrent hasn't started. Select any number and pull them
+straight from the server instead of waiting for peers.
+
+They are written **into the torrent's own files**, so the extractor finds them
+where it always looks and qBittorrent can seed them. That means:
+
+- the torrent is paused for the run — not optional, since qBittorrent must not
+  write to those files at the same time. If it won't pause, the run doesn't
+  start. Afterwards it is put back exactly as it was found: a torrent that was
+  already stopped stays stopped, and only one that was actually running is
+  started again. The same rule holds everywhere the app pauses it.
+- each file is downloaded beside the original, verified against the sha256 in
+  its name, and only then moved into place. A failed or corrupt download can't
+  damage the partial data the torrent already had.
+- qBittorrent still thinks the files are missing until it rechecks. Tick
+  **recheck the torrent afterwards** to have it done for you, or run a recheck
+  yourself later — a recheck of a multi-terabyte torrent is not quick.
+
+Select some files and the status line estimates how long the run would take,
+warning before a run over twenty minutes. The estimate comes from the speed
+you are actually getting this session — no rates are assumed, because mirrors
+differ by orders of magnitude (one measured at 1.9 MB/s while another served the
+same file at 10 KB/s). Until something has been downloaded it says so instead of
+guessing.
+
+**One file only ever gets one connection**, so extra threads can't speed up a
+single large file. On a slow mirror that makes the multi-gigabyte depots a bad
+trade against the torrent; on a fast one it hardly matters. The **Server**
+dropdown is worth trying when throughput looks poor.
+
+**Process** — what to do with a build once it is extracted. Pick one of your
+extracted depots — several at once, they queue up — and pull the **images,
+audio and video** out of them into three
+flat folders — `images/`, `audio/`, `videos/` — under the media folder. The
+game's own directory tree is *not* kept, so two files called `wall01.vtf`
+become `wall01.vtf` and `wall01_1.vtf`; a name that is already there at the same
+size is one you pulled out before and is left alone, so re-running doesn't pile
+up copies. Loose media is copied, needs no tools, and the build is never
+modified.
+
+`.vpk` archives need a tool. Point **Source2Viewer** at the **CLI** —
+`Source2Viewer-CLI.exe` from
+[ValveResourceFormat](https://github.com/ValveResourceFormat/ValveResourceFormat),
+*not* the GUI of the same name, which just opens whatever it is handed and can't
+be driven from here (if you pick it anyway, the app recognises its complaints
+and stops rather than opening a window per archive). Multi-part archives are
+opened through their `_dir` file. Each one unpacks into `_media/_vpk/<archive>/`
+and its media is then lifted into the same three folders, leaving anything else
+it produced in `_vpk`. It is optional — leave it empty and loose media still
+works, with the archives reported as skipped. Be aware that Source2Viewer
+targets **Source 2** while these depots are Source 1: expect it to open `.vpk`
+archives rather than convert what is inside them. The argument line is editable
+for that reason, and *Tool help* prints what your build accepts.
+
+**Settings** — the mirror, the four folders (*Save to*, *Extract to*, the
+torrent folder, and where processed media goes), the optional Source2Viewer
+path, and the download options. It says what is still missing, and warns if
+*Save to* would land inside the torrent folder.
 
 **Queue** — Start/Pause/Stop, resumable via HTTP Range. *Verify on disk*
 re-hashes against the sha256 in each filename. *Restore dates* applies the
-server's original timestamps from `blobs_dates.txt` / `dats_dates.txt`.
-*Unattended* drops the prompts and retries failures every minute.
+timestamps from `blobs_dates.txt` / `dats_dates.txt` — these are *archival*
+dates, recording how the files sat on the content server when it was captured
+rather than when a depot is from, and the blob dates are the more trustworthy
+half. *Unattended* drops the prompts and retries failures every minute.
 
 ## Names
 
@@ -107,7 +181,7 @@ re-established automatically, so long runs don't die halfway.
 
 | Folder | Owner | Contents |
 |---|---|---|
-| torrent folder | qBittorrent | the dump. The app only ever **reads** it |
+| torrent folder | qBittorrent | the dump. Only ever **read**, except a deliberate mirror download or a dat deletion you confirm |
 | **Save to** | the app | only what the torrent can't provide |
 | **Output** | the app | extracted files |
 
@@ -166,6 +240,12 @@ Arguments: blobs dir, dats dir, depot, version. Options: `--out`, `--filter
 | `s2downloader.log` | the log panes, kept after closing (rotates at 5 MB) |
 | `depot_names.json` | optional, yours — overrides fetched names |
 | `<out>/<depot> - <name>_v<version>/` | extracted files |
+
+Mirrors do not all run the same directory index, and some publish rounded sizes
+("3.5 KiB") rather than byte counts. Both layouts are read, and a rounded size is
+only ever compared to the precision it was given in - the sha256 in every
+filename is the real check. An index that cannot be read is reported as an
+error rather than cached as an empty archive.
 
 Expect the server to be slow — 5–25 s just to start answering. Timeouts are 90 s
 with retries and keep-alive; listings are cached, and a failed refresh keeps the

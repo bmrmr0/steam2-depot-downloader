@@ -24,6 +24,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -61,16 +62,52 @@ QUEUE_PATH = HERE / "s2queue.json"
 NAMES_PATH = HERE / "depot_names.json"   # optional {"852": "Half-Life 2 content"} map
 NAMES_CACHE = CACHE_DIR / "steam_names.json"   # names fetched from Steam, cached forever
 HISTORY_PATH = HERE / "s2extracted.json"       # what has been extracted, and where
+# Optional, yours, and not shipped: ["http://mirror.one/", "http://mirror.two/"]
+# or {"label": "http://mirror.one/"}. Whatever is here fills the Server dropdown,
+# along with the servers you have actually used.
+MIRRORS_PATH = HERE / "mirrors.json"
 LOG_PATH = HERE / "s2downloader.log"           # the log panes, kept after you close
 
 # depot_version_crc_sha256.ext
 NAME_RE = re.compile(r"^(\d+)_(\d+)_([0-9A-Fa-f]{8})_([0-9A-Fa-f]{64})\.(blob|dat)$")
-# nginx autoindex row
+# Mirrors do not all run the same index. Plain nginx autoindex writes one <a>
+# per line followed by the date and the byte count; nginx fancyindex, Apache and
+# Caddy write an HTML table instead, with human sizes like "3.5 KiB". Both are
+# understood, because a mirror whose index does not parse looks exactly like an
+# empty archive.
 ENTRY_RE = re.compile(
     r'<a href="([^"?]+)">[^<]*</a>\s+'
     r'(\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2})\s+'
     r'([0-9-]+)'
 )
+# a table row: the link cell, then the remaining cells of that row
+ROW_RE = re.compile(r'<a href="([^"?]+)"[^>]*>.*?</a>\s*</t[dh]>(.*?)</tr>',
+                    re.I | re.S)
+CELL_RE = re.compile(r'<t[dh][^>]*>(.*?)</t[dh]>', re.I | re.S)
+TAG_RE = re.compile(r'<[^>]+>')
+# "1234", "3.5 KiB", "1.2K", "-"
+SIZE_RE = re.compile(r'^([\d.,]+)\s*([KMGTP])?i?B?$', re.I)
+
+# What "Process" pulls out of an extracted build. Source 1 depots keep media
+# both loose on disk and inside .vpk archives; the loose half needs no tools.
+MEDIA_KINDS = {
+    "images": (".vtf", ".tga", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".psd",
+               ".ico", ".pcx", ".dds"),
+    "audio": (".wav", ".mp3", ".ogg", ".flac", ".aiff", ".mid"),
+    "videos": (".bik", ".avi", ".mov", ".mp4", ".mpg", ".mpeg", ".wmv", ".roq",
+               ".webm", ".ogv"),
+}
+# multi-part archives are opened through their _dir file, not one part at a time
+VPK_PART_RE = re.compile(r"_\d{3}\.vpk$", re.I)
+# The GUI and the CLI ship in the same release and look alike. Handed a flag,
+# the GUI treats it as a filename and says so, then sits there with a window
+# open - so its own complaint is what tells us the wrong one was picked.
+S2V_GUI_SIGNS = ("[mainform]", "'-i' does not exist", "'-o' does not exist",
+                 "'-e' does not exist", "'-d' does not exist")
+# Flags differ between Source2Viewer releases, so this is only a starting point:
+# it is editable on the tab, and "Tool help" prints what your build accepts.
+S2V_ARGS = '-i "{input}" -o "{output}" -e "{ext}" -d'
+BUILD_RE = re.compile(r"^(\d+)\s*-\s*(.*?)_v(\d+)$")
 
 STATUS_QUEUED = "queued"
 STATUS_ACTIVE = "downloading"
@@ -91,6 +128,71 @@ def human(n) -> str:
             return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
         n /= 1024.0
     return f"{n:,.1f} PB"
+
+
+def parse_size(text: str):
+    """A size cell -> (bytes, rounded?).
+
+    Byte counts are exact. "3.5 KiB" is not: it stands for anything between
+    3.45 and 3.55 KiB, and callers have to know that before they compare it
+    with a file on disk."""
+    t = text.strip().replace(" ", " ")
+    if not t or t == "-":
+        return 0, False
+    m = SIZE_RE.match(t)
+    if not m:
+        return 0, False
+    try:
+        n = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0, False
+    unit = (m.group(2) or "").upper()
+    if not unit:
+        return int(n), False
+    return int(n * (1024 ** ("KMGTP".index(unit) + 1))), True
+
+
+def size_match(actual: int, listed: int, approx: bool = False) -> bool:
+    """Is the file on disk the size the listing said it would be?
+
+    When the index only publishes rounded sizes, an exact comparison calls
+    every finished file unfinished - and the download path answers that by
+    deleting it and fetching it again. So a rounded size is matched to the
+    precision it was given in; the sha256 in the filename stays the real
+    check either way."""
+    if not listed:
+        return True
+    if actual == listed:
+        return True
+    return approx and abs(actual - listed) <= listed * 0.06
+
+
+def mirror_eta(sizes, agg_bps: float, conn_bps: float):
+    """Seconds a mirror run should take, or None if nothing has been measured.
+
+    Speeds differ by orders of magnitude between mirrors, so nothing here is
+    assumed - these rates come from downloads this session has actually done.
+    One file only ever gets one connection, so a single huge file sets the floor
+    however many threads are running."""
+    if not sizes or agg_bps <= 0:
+        return None
+    floor = max(sizes) / conn_bps if conn_bps > 0 else 0.0
+    return max(sum(sizes) / agg_bps, floor)
+
+
+def duration(secs: float) -> str:
+    if secs < 90:
+        return f"{int(secs)} seconds"
+    if secs < 5400:
+        return f"about {round(secs / 60)} minutes"
+    return f"about {secs / 3600:.1f} hours"
+
+
+def bar(fraction, width: int = 10) -> str:
+    """A progress bar for a table cell - Treeview holds text, not widgets."""
+    f = max(0.0, min(1.0, float(fraction or 0)))
+    filled = int(round(f * width))
+    return "█" * filled + "░" * (width - filled) + f" {f * 100:5.1f}%"
 
 
 def human_speed(bps: float) -> str:
@@ -166,6 +268,7 @@ class Entry:
     is_dir: bool
     size: int
     date: str
+    approx: bool = False        # the index only gave a rounded size ("3.5 KiB")
 
 
 class Listing:
@@ -190,9 +293,13 @@ class Listing:
     def _read_cache(self, url: str):
         try:
             raw = json.loads(self._cache_file(url).read_text("utf-8"))
-            return [Entry(*e) for e in raw["entries"]]
+            entries = [Entry(*e) for e in raw["entries"]]
         except Exception:
             return None
+        # An empty listing means the index was not understood, not that the
+        # archive is empty - and once cached it would keep the depot list empty
+        # forever. Throw it away and ask again.
+        return entries or None
 
     def get(self, url: str, refresh: bool = False):
         if not refresh and url in self.mem:
@@ -218,8 +325,8 @@ class Listing:
         try:
             cf.write_text(json.dumps(
                 {"url": url, "at": time.time(),
-                 "entries": [[e.name, e.is_dir, e.size, e.date] for e in entries]}),
-                "utf-8")
+                 "entries": [[e.name, e.is_dir, e.size, e.date, e.approx]
+                             for e in entries]}), "utf-8")
         except Exception:
             pass
         return entries
@@ -245,14 +352,36 @@ class Listing:
             conn.close()
 
         out = []
-        for href, date, size in ENTRY_RE.findall(html):
+        for href, size, date in Listing._rows(html):
             if href.startswith("../") or href in ("../", "/"):
                 continue
             is_dir = href.endswith("/")
             name = unquote(href[:-1] if is_dir else href)
-            out.append(Entry(name, is_dir, 0 if size.strip() == "-" else int(size), date))
+            n, approx = parse_size(size)
+            out.append(Entry(name, is_dir, n, date.strip(), approx))
+        if not out:
+            raise IOError(f"nothing readable in the index at {url} - the server "
+                          f"answered, but its file list is in a format this "
+                          f"version does not understand")
         out.sort(key=lambda e: (not e.is_dir, e.name.lower()))
         return out
+
+    @staticmethod
+    def _rows(html: str):
+        """(href, size text, date text) for every row, whichever index this is."""
+        rows = [(href, size, date)
+                for href, date, size in ENTRY_RE.findall(html)]
+        if rows:
+            return rows
+        for href, rest in ROW_RE.findall(html):
+            cells = [TAG_RE.sub("", c).replace("&nbsp;", " ").strip()
+                     for c in CELL_RE.findall(rest)]
+            # the two remaining columns are a size and a date, but their order
+            # differs between servers, so they are told apart by shape
+            size = next((c for c in cells if SIZE_RE.match(c) or c == "-"), "-")
+            date = next((c for c in cells if c is not size and c != "-"), "")
+            rows.append((href, size, date))
+        return rows
 
 
 # --------------------------------------------------------------------------- download
@@ -267,6 +396,12 @@ class Job:
     speed: float = 0.0
     error: str = ""
     iid: str = ""               # treeview row id
+    dest: str = ""              # absolute override: mirror files are written
+                                # into the torrent's own layout, not the save folder
+    overwrite: bool = False     # the file already exists but is half-downloaded
+                                # by qBittorrent: fetch it anyway, replace at the end
+    approx: bool = False        # size came rounded from the index, so it is only
+                                # good to the precision it was printed at
 
 
 class Conn:
@@ -445,21 +580,29 @@ class Downloader:
             conn.close()
 
     def _download(self, job: Job, conn: Conn):
-        dest = self.save_dir / job.rel
+        dest = Path(job.dest) if job.dest else self.save_dir / job.rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_name(dest.name + ".part")
 
         # already on disk? (size check only - re-hashing terabytes on every restart
         # would be unusable; use "Verify on disk" for a full check)
-        if dest.exists():
-            if job.size == 0 or dest.stat().st_size == job.size:
+        # A mirror job points at a file qBittorrent is midway through. It may
+        # already be full size (preallocated) while being full of holes, so the
+        # size check must not skip it - and its partial data must not be thrown
+        # away up front. Download beside it and replace it only once verified.
+        if dest.exists() and not job.overwrite:
+            if size_match(dest.stat().st_size, job.size, job.approx):
                 job.done = job.size or dest.stat().st_size
                 job.status = STATUS_SKIP
                 return
             dest.unlink()
 
         start = part.stat().st_size if part.exists() else 0
-        if job.size and start >= job.size:
+        # a .part bigger than the whole file is junk and gets restarted - but a
+        # rounded size is not the whole file, so leave room before throwing away
+        # a nearly-finished download
+        limit = job.size * 1.06 if job.approx else job.size
+        if job.size and start >= limit:
             start = 0
             if part.exists():
                 part.unlink()
@@ -515,7 +658,7 @@ class Downloader:
                         self.mark(job)
             resp.close()
 
-        if job.size and part.stat().st_size != job.size:
+        if not size_match(part.stat().st_size, job.size, job.approx):
             raise IOError(f"short read {part.stat().st_size}/{job.size}")
 
         if self.verify and job.sha256 and h.hexdigest().lower() != job.sha256.lower():
@@ -929,7 +1072,7 @@ class QBit:
             except Exception as exc:                                # noqa: BLE001
                 raise QBitError(f"{type(exc).__name__}: {exc}") from exc
             self._grab_sid(hdrs)
-            # sessions expire (an hour by default) - a batch running overnight
+            # sessions expire (an hour by default) - a queue running overnight
             # would otherwise die on a 403 halfway through
             if st == 403 and retry and path != self.LOGIN and (self.user or self.pw):
                 self.sid = ""
@@ -1007,6 +1150,29 @@ class QBit:
         except Exception:
             raise QBitError(f"unexpected reply from qBittorrent: {body[:120]!r}")
 
+    # states qBittorrent reports for a torrent that is NOT running. 4.x says
+    # "paused", 5.x says "stopped"; queued and errored ones are not running
+    # either, and starting one of those is not "putting it back as we found it"
+    STOPPED = ("pauseddl", "pausedup", "stoppeddl", "stoppedup", "queueddl",
+               "queuedup", "error", "missingfiles", "unknown")
+
+    def state(self, thash: str) -> str:
+        """The torrent's current state, or "" if it cannot be read."""
+        st, body, _ = self._req(f"/api/v2/torrents/info?hashes={quote(thash)}")
+        if st != 200:
+            raise QBitError(f"torrents/info returned HTTP {st}")
+        try:
+            rows = json.loads(body)
+        except Exception:
+            raise QBitError("could not read the torrent's state")
+        return (rows[0].get("state", "") if rows else "")
+
+    @staticmethod
+    def is_running(state: str) -> bool:
+        """Was it actually going? An unreadable state counts as running, so we
+        err towards putting it back rather than leaving it stopped."""
+        return state.lower() not in QBit.STOPPED
+
     def files(self, thash: str):
         st, body, _ = self._req(f"/api/v2/torrents/files?hash={quote(thash)}")
         if st != 200:
@@ -1028,6 +1194,36 @@ class QBit:
                                  "priority": priority})
         if st != 200:
             raise QBitError(f"filePrio returned HTTP {st} {body[:80]!r}")
+
+    def web_seeds(self, thash: str):
+        """Web seeds already on the torrent. [] on builds too old to know."""
+        st, body, _ = self._req(f"/api/v2/torrents/webseeds?hash={quote(thash)}")
+        if st == 404:
+            raise QBitError("this qBittorrent is too old to manage web seeds "
+                            "over the Web UI - add it from the torrent's "
+                            "properties instead")
+        if st != 200:
+            raise QBitError(f"webseeds returned HTTP {st}")
+        try:
+            return [w.get("url", "") for w in json.loads(body)]
+        except Exception:
+            return []
+
+    def add_web_seeds(self, thash: str, urls):
+        st, body, _ = self._req("/api/v2/torrents/addWebSeeds",
+                                {"hash": thash, "urls": "|".join(urls)})
+        if st == 404:
+            raise QBitError("this qBittorrent is too old to add web seeds over "
+                            "the Web UI - add it from the torrent's properties")
+        if st == 400:
+            raise QBitError(f"qBittorrent rejected the URL ({body[:60]!r})")
+        if st not in (200, 204):
+            raise QBitError(f"addWebSeeds returned HTTP {st}")
+
+    def recheck(self, thash: str):
+        st, body, _ = self._req("/api/v2/torrents/recheck", {"hashes": thash})
+        if st != 200:
+            raise QBitError(f"recheck returned HTTP {st} {body[:60]!r}")
 
     def pause(self, thash: str):
         # qBittorrent 5.x renamed pause -> stop; try both
@@ -1136,9 +1332,10 @@ class App(tk.Tk):
         self.pipe = None                      # active download->extract pipeline
         self.last_out = None                  # folder the last extraction wrote to
         self.stage_dir = None                 # temporary link farm, cleaned up after
-        self.batch = []                       # depots still to extract in this batch
-        self.batch_total = 0
-        self.batch_pending = False
+        self.tasks = []                       # extractions + processing runs, waiting
+        self.task_total = 0                   # how many this run started with
+        self.task_pending = False
+        self.current_task = None              # the one actually running
         self.unatt_var = tk.BooleanVar(value=False)
         self.history = {}                     # depot -> what was extracted, and where
         try:
@@ -1160,13 +1357,38 @@ class App(tk.Tk):
         self.qb_tor_var = tk.StringVar()
         self.qb_status_var = tk.StringVar(value="not connected")
         self.mirror_rows = []                 # incomplete files the torrent wants
+        self.msort = ("name", False)          # mirror list: sort column, reversed?
+        self.qsort = (None, False)            # queue: None = the order you added
+        self.servers = []                     # mirrors you have used, newest first
+        self.mirrors = []                     # from mirrors.json, if you have one
+        try:
+            raw = json.loads(MIRRORS_PATH.read_text("utf-8"))
+            self.mirrors = ([str(v) for v in raw.values()]
+                            if isinstance(raw, dict) else [str(v) for v in raw])
+        except Exception:
+            pass
         self.mirror_job = None                # an HTTP mirror run in progress
-        self.mirror_pause_var = tk.BooleanVar(value=True)
-        self.mirror_skip_var = tk.BooleanVar(value=False)
+        self.mirror_recheck_var = tk.BooleanVar(value=False)
+        self.qb_webseed_var = tk.StringVar()
+        # observed download rates, this session only - they belong to whichever
+        # mirror is in use, so they are never persisted or assumed
+        self.rate_agg = 0.0                   # bytes/s across all workers
+        self.rate_conn = 0.0                  # best bytes/s seen on one file
         self.mirror_status_var = tk.StringVar(value="not connected to qBittorrent")
         # remembered from the last session so the depot list knows where the
         # torrent lives before qBittorrent is connected. Never written to.
         self.torrent_dir_var = tk.StringVar()
+
+        # ---- Process tab: turning an extracted build into plain media files
+        self.s2v_var = tk.StringVar()         # Source2Viewer CLI, only needed for vpk
+        self.media_var = tk.StringVar()       # where the pulled-out media goes
+        self.s2v_args_var = tk.StringVar(value=S2V_ARGS)
+        self.kind_vars = {k: tk.BooleanVar(value=True) for k in MEDIA_KINDS}
+        self.vpk_var = tk.BooleanVar(value=True)
+        self.proc_rows = []                   # extracted builds you can process
+        self.proc_busy = False
+        self.proc_stop = threading.Event()
+        self.proc_proc = None                 # Source2Viewer, while it runs
 
         self.dfilter_var = tk.StringVar()
         self.depot_stats = []                 # aggregated depot index
@@ -1189,12 +1411,13 @@ class App(tk.Tk):
         self.after(200, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, lambda: self.navigate(""))
+        self.after(600, self._autoload_depots)
         self.after(900, self._qb_autoconnect)
         if self.first_run:
+            self.nb.select(self.settings_tab)
             self.status_var.set(
-                'first run - put the archive address in "Server" at the top, set '
-                f'"Save to" (now "{self.dir_var.get()}"), then Depots -> '
-                "Load depot list.")
+                "first run - set the server and the folders here, then press Save. "
+                "The depot list builds itself from there.")
         self.after(60000, self._unattended_tick)
         try:                                   # keep the disk log from growing forever
             if LOG_PATH.exists() and LOG_PATH.stat().st_size > 5 << 20:
@@ -1232,6 +1455,11 @@ class App(tk.Tk):
             self.qb_auto_var.set(bool(s.get("qb_autoconnect", True)))
             self.qb_hash = s.get("qb_hash", "")
             self.torrent_dir_var.set(s.get("torrent_dir", ""))
+            self.servers = [str(x) for x in s.get("servers", []) if x]
+            self.qb_webseed_var.set(s.get("webseed", ""))
+            self.s2v_var.set(s.get("s2v_path", ""))
+            self.media_var.set(s.get("media_dir", ""))
+            self.s2v_args_var.set(s.get("s2v_args", S2V_ARGS))
             if s.get("geometry"):
                 self.geometry(s["geometry"])
         except Exception:
@@ -1254,6 +1482,11 @@ class App(tk.Tk):
                 "qb_autoconnect": bool(self.qb_auto_var.get()),
                 "qb_hash": self.qb_hash,
                 "torrent_dir": self.torrent_dir_var.get(),
+                "servers": self.servers,
+                "webseed": self.qb_webseed_var.get(),
+                "s2v_path": self.s2v_var.get(),
+                "media_dir": self.media_var.get(),
+                "s2v_args": self.s2v_args_var.get(),
                 "geometry": self.geometry(),
             }, indent=2), "utf-8")
         except Exception:
@@ -1269,7 +1502,10 @@ class App(tk.Tk):
         top = ttk.Frame(self, padding=(8, 6))
         top.pack(fill="x")
         ttk.Label(top, text="Server:").pack(side="left")
-        ttk.Entry(top, textvariable=self.base_var, width=30).pack(side="left", padx=(4, 10))
+        # editable: pick a known mirror, or just type one
+        self.base_combo = ttk.Combobox(top, textvariable=self.base_var, width=28)
+        self.base_combo.pack(side="left", padx=(4, 10))
+        self._refresh_servers()
         ttk.Label(top, text="Save to:").pack(side="left")
         ttk.Entry(top, textvariable=self.dir_var, width=34).pack(side="left", padx=4)
         ttk.Button(top, text="Browse...", command=self._pick_dir).pack(side="left")
@@ -1294,6 +1530,8 @@ class App(tk.Tk):
         self._build_extract(nb)
         self._build_qbit(nb)
         self._build_mirror(nb)
+        self._build_process(nb)
+        self._build_settings(nb)
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._build_queue(main)
 
@@ -1365,6 +1603,9 @@ class App(tk.Tk):
         self.dmenu.add_command(label="Open extracted output",
                                command=self._open_extracted)
         self.dmenu.add_command(label="Copy depot id(s)", command=self._copy_depot_ids)
+        self.dmenu.add_separator()
+        self.dmenu.add_command(label="Delete this depot's dats (keep blobs)",
+                               command=self._delete_dats)
 
     def _build_browse(self, nb):
         f = ttk.Frame(nb, padding=6)
@@ -1429,7 +1670,7 @@ class App(tk.Tk):
         ttk.Button(row, text="Scan", command=self._scan_depot).pack(side="left")
         ttk.Button(row, text="Rescan from server",
                    command=lambda: self._scan_depot(True)).pack(side="left", padx=4)
-        ttk.Label(row, text="   up to version:").pack(side="left")
+        ttk.Label(row, text="   version:").pack(side="left")
         ttk.Entry(row, textvariable=self.maxver_var, width=8).pack(side="left", padx=4)
         ttk.Button(row, text="Download + extract",
                    command=self._extract_from_picker).pack(side="left", padx=(12, 4))
@@ -1459,6 +1700,7 @@ class App(tk.Tk):
                         ("blob", 130, "e"), ("dat", 130, "e"), ("have", 110, "w")):
             self.dtv.heading(c, text=heads[c])
             self.dtv.column(c, width=w, anchor=a)
+        self.dtv.bind("<<TreeviewSelect>>", self._on_pick_version)
         sb = ttk.Scrollbar(body, orient="vertical", command=self.dtv.yview)
         self.dtv.configure(yscrollcommand=sb.set)
         self.dtv.pack(side="left", fill="both", expand=True)
@@ -1507,16 +1749,41 @@ class App(tk.Tk):
 
         btns = ttk.Frame(f)
         btns.pack(fill="x", pady=8)
-        self.btn_extract = ttk.Button(btns, text="Download what's missing, then extract",
+        self.btn_extract = ttk.Button(btns, text="Queue: download what's missing, "
+                                                  "then extract",
                                       command=self._go_extract)
         self.btn_extract.pack(side="left")
-        ttk.Button(btns, text="Extract now (skip download)",
+        ttk.Button(btns, text="Queue: extract only (skip download)",
                    command=lambda: self._go_extract(download=False)).pack(side="left", padx=6)
         ttk.Button(btns, text="Stop", command=self._stop_extract).pack(side="left")
         ttk.Button(btns, text="Open output folder",
                    command=self._open_out).pack(side="left", padx=(12, 0))
         ttk.Button(btns, text="Clear log",
                    command=lambda: self.log_txt.delete("1.0", "end")).pack(side="right")
+
+        q = ttk.LabelFrame(f, text="Task queue", padding=6)
+        q.pack(fill="x", pady=(0, 6))
+        qrow = ttk.Frame(q)
+        qrow.pack(fill="x")
+        self.task_note_var = tk.StringVar(value="nothing queued")
+        ttk.Label(qrow, textvariable=self.task_note_var, foreground="#555").pack(side="left")
+        ttk.Label(qrow, foreground="#777",
+                  text=("   extractions and processing runs, one after another - "
+                        "queue more from the Depot picker and the Process tab")
+                  ).pack(side="left")
+        ttk.Button(qrow, text="Remove", command=self._remove_tasks).pack(side="right")
+        qbody = ttk.Frame(q)
+        qbody.pack(fill="x", pady=(4, 0))
+        self.ttv = ttk.Treeview(qbody, columns=("kind", "what", "status"),
+                                show="headings", height=4)
+        for c, w, a in (("kind", 80, "w"), ("what", 620, "w"), ("status", 90, "w")):
+            self.ttv.heading(c, text=c.capitalize())
+            self.ttv.column(c, width=w, anchor=a, stretch=(c == "what"))
+        tsb = ttk.Scrollbar(qbody, orient="vertical", command=self.ttv.yview)
+        self.ttv.configure(yscrollcommand=tsb.set)
+        self.ttv.pack(side="left", fill="x", expand=True)
+        tsb.pack(side="left", fill="y")
+        self.ttv.tag_configure("run", foreground="#0b57d0")
 
         wrap = ttk.Frame(f)
         wrap.pack(fill="both", expand=True)
@@ -1559,6 +1826,18 @@ class App(tk.Tk):
         self.qb_combo.pack(side="left")
         self.qb_combo.bind("<<ComboboxSelected>>", self._qb_pick)
         ttk.Button(g2, text="Reload", command=self._qb_load_torrents).pack(side="left", padx=6)
+
+        g3 = ttk.LabelFrame(f, text="Web seed", padding=8)
+        g3.pack(fill="x", pady=(0, 8))
+        ttk.Label(g3, text="URL:").pack(side="left")
+        ttk.Entry(g3, textvariable=self.qb_webseed_var, width=44).pack(side="left",
+                                                                      padx=4)
+        ttk.Button(g3, text="Add to torrent",
+                   command=self._qb_add_webseed).pack(side="left", padx=4)
+        ttk.Label(g3, foreground="#555", wraplength=420, justify="left",
+                  text=("Lets the torrent pull pieces from the mirror over HTTP as "
+                        "well as from peers. Helps when peers are scarce, and the "
+                        "URL is remembered.")).pack(side="left", padx=8)
         ttk.Label(f, textvariable=self.torrent_dir_var, foreground="#555").pack(anchor="w")
         ttk.Label(f, text="^ the torrent's folder: read for extraction, never written to",
                   foreground="#777").pack(anchor="w", pady=(0, 6))
@@ -1604,18 +1883,24 @@ class App(tk.Tk):
         ttk.Button(row, text="Select all",
                    command=lambda: self.mtv.selection_set(
                        *self.mtv.get_children())).pack(side="left")
+        ttk.Button(row, text="Select untouched (0%)",
+                   command=self._mirror_select_zero).pack(side="left", padx=4)
+        self.mirror_pbar = ttk.Progressbar(row, length=180, mode="determinate")
+        self.mirror_pbar.pack(side="right")
         ttk.Label(row, textvariable=self.mirror_status_var,
                   foreground="#0b57d0").pack(side="left", padx=12)
 
         opts = ttk.Frame(f)
         opts.pack(fill="x", pady=(0, 6))
-        ttk.Checkbutton(opts, text="pause the torrent while downloading, resume when done",
-                        variable=self.mirror_pause_var).pack(anchor="w")
+        ttk.Label(opts, foreground="#555",
+                  text=("The torrent is paused for the download and resumed "
+                        "afterwards - these are its own files, so it must not be "
+                        "writing to them at the same time.")).pack(anchor="w")
         ttk.Checkbutton(
-            opts, variable=self.mirror_skip_var,
-            text=("after mirroring, set those files to \"do not download\" in "
-                  "qBittorrent (stops it fetching them a second time - but the "
-                  "torrent then stays incomplete for seeding)")).pack(anchor="w")
+            opts, variable=self.mirror_recheck_var,
+            text=("recheck the torrent afterwards, so qBittorrent counts the "
+                  "mirrored files and can seed them (a recheck of a large "
+                  "torrent takes a while)")).pack(anchor="w")
 
         body = ttk.Frame(f)
         body.pack(fill="both", expand=True)
@@ -1625,24 +1910,39 @@ class App(tk.Tk):
         self.mtv = ttk.Treeview(body, columns=cols, show="headings",
                                 selectmode="extended")
         for c, w, a in (("name", 460, "w"), ("depot", 80, "e"), ("size", 100, "e"),
-                        ("got", 100, "e"), ("left", 100, "e"), ("prio", 90, "w")):
-            self.mtv.heading(c, text=heads[c])
+                        ("got", 200, "w"), ("left", 100, "e"), ("prio", 90, "w")):
+            self.mtv.heading(c, text=heads[c],
+                             command=lambda x=c: self._sort_mirror(x))
             self.mtv.column(c, width=w, anchor=a, stretch=(c == "name"))
         sb = ttk.Scrollbar(body, orient="vertical", command=self.mtv.yview)
         self.mtv.configure(yscrollcommand=sb.set)
         self.mtv.pack(side="left", fill="both", expand=True)
         sb.pack(side="left", fill="y")
+        self.mtv.bind("<<TreeviewSelect>>", self._mirror_selection_note)
 
         ttk.Label(f, foreground="#555", wraplength=980, justify="left",
                   text=("Everything qBittorrent has queued but not finished. Pick "
                         "the ones you don't want to wait for and pull them from the "
-                        "server instead - they land in your download folder, which "
-                        "the extractor reads alongside the torrent's. The torrent "
-                        "folder is never written to.")).pack(anchor="w", pady=(6, 0))
+                        "server instead. They are written into the torrent's own "
+                        "files, so the extractor finds them where it always looks "
+                        "and qBittorrent can seed them once it has rechecked. Each "
+                        "file is verified against the sha256 in its name and only "
+                        "then put in place, so a failed download can't damage what "
+                        "the torrent already had.")).pack(anchor="w", pady=(6, 0))
 
     def _build_queue(self, parent):
         f = ttk.Frame(parent, padding=(6, 4))
         parent.add(f, weight=2)
+
+        head = ttk.Frame(f)
+        head.pack(fill="x")
+        ttk.Label(head, text="Download queue",
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Label(head, foreground="#555",
+                  text=("  - every file this app is fetching over HTTP, from any "
+                        "tab. Rows stay after they finish or fail so you can see "
+                        "what happened; they are restored when you reopen the app."
+                        )).pack(side="left")
 
         ctl = ttk.Frame(f)
         ctl.pack(fill="x", pady=(0, 4))
@@ -1668,7 +1968,8 @@ class App(tk.Tk):
         self.qtv = ttk.Treeview(body, columns=cols, show="headings", height=8)
         for c, w, a in (("name", 620, "w"), ("size", 100, "e"), ("progress", 90, "e"),
                         ("speed", 100, "e"), ("status", 220, "w")):
-            self.qtv.heading(c, text=c.capitalize())
+            self.qtv.heading(c, text=c.capitalize(),
+                             command=lambda x=c: self._sort_queue(x))
             self.qtv.column(c, width=w, anchor=a, stretch=(c == "name"))
         sb = ttk.Scrollbar(body, orient="vertical", command=self.qtv.yview)
         self.qtv.configure(yscrollcommand=sb.set)
@@ -1684,6 +1985,567 @@ class App(tk.Tk):
         self.qtv.tag_configure("err", foreground="#c00000")
         self.qtv.tag_configure("act", foreground="#0b57d0")
 
+    def _build_settings(self, nb):
+        """Everything you have to set once, in one place.
+
+        The same three folders are reachable from the top bar and the Extract
+        tab, but only if you already know which is which - so a fresh install
+        opens here instead of on an empty depot list."""
+        outer = ttk.Frame(nb)
+        nb.add(outer, text="Settings")
+        self.settings_tab = outer
+        # the queue pane takes the bottom of the window, so this does not fit in
+        # what is left of a default-sized one - give it a scrollbar rather than
+        # hiding the Save button below the fold
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        f = ttk.Frame(canvas, padding=6)
+        self.settings_inner = f
+        win = canvas.create_window((0, 0), window=f, anchor="nw")
+        f.bind("<Configure>",
+               lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+
+        def wheel(e):
+            canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        # only while the pointer is over it, so the depot list keeps its own wheel
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        ttk.Label(f, justify="left", foreground="#555", wraplength=980,
+                  text=("Set these once and they are remembered. Nothing here is "
+                        "written until you press Save.")).pack(anchor="w", pady=(0, 8))
+
+        g = ttk.LabelFrame(f, text="Where things live", padding=8)
+        g.pack(fill="x")
+        g.columnconfigure(1, weight=1)
+
+        def row(n, label, var, browse, hint, open_cmd=None):
+            ttk.Label(g, text=label).grid(row=n * 2, column=0, sticky="w", pady=(0, 2))
+            ttk.Entry(g, textvariable=var).grid(row=n * 2, column=1, sticky="ew", padx=6)
+            ttk.Button(g, text="Browse...", command=browse).grid(row=n * 2, column=2)
+            if open_cmd:
+                ttk.Button(g, text="Open", command=open_cmd).grid(
+                    row=n * 2, column=3, padx=(4, 0))
+            ttk.Label(g, text=hint, foreground="#777").grid(
+                row=n * 2 + 1, column=1, sticky="w", padx=6, pady=(0, 8))
+
+        ttk.Label(g, text="Server:").grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self.set_combo = ttk.Combobox(g, textvariable=self.base_var)
+        self.set_combo.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(g, text="the mirror the archive is downloaded from - the same box "
+                          "as in the top bar", foreground="#777").grid(
+            row=1, column=1, sticky="w", padx=6, pady=(0, 8))
+        row(1, "Save to:", self.dir_var, self._pick_dir,
+            "files fetched over HTTP land here. It must not be inside the torrent "
+            "folder", self._open_dir)
+        row(2, "Extract to:", self.out_var, self._pick_out,
+            "one folder per depot and version is created here", self._open_out)
+        row(3, "Torrent folder:", self.torrent_dir_var, self._pick_torrent,
+            "read for extraction, never written to. Filled in for you when "
+            "qBittorrent connects")
+        row(4, "Media out:", self.media_var, self._pick_media,
+            "where the Process tab puts images, audio and video. Defaults to "
+            '"_media" beside the extracted build', self._open_media)
+        row(5, "Source2Viewer:", self.s2v_var, self._pick_s2v,
+            "optional: Source2Viewer-CLI.exe, only needed to open .vpk archives "
+            "on the Process tab. Not the GUI - it cannot be driven from here")
+        self._refresh_servers()
+
+        self.set_note_var = tk.StringVar(value="")
+        self.set_note = ttk.Label(f, textvariable=self.set_note_var, wraplength=980,
+                                  justify="left")
+        self.set_note.pack(anchor="w", pady=(6, 0))
+
+        g2 = ttk.LabelFrame(f, text="Downloading", padding=8)
+        g2.pack(fill="x", pady=8)
+        ttk.Label(g2, text="threads:").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(g2, from_=1, to=16, width=4, textvariable=self.workers_var).grid(
+            row=0, column=1, padx=(4, 12))
+        ttk.Label(g2, text="one file only ever gets one connection, so this is how "
+                           "many files run at once", foreground="#777").grid(
+            row=0, column=2, sticky="w")
+        ttk.Checkbutton(g2, text="verify sha256 after every download",
+                        variable=self.verify_var).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(g2, text="group downloads into blobs/<depot>/ and dats/<depot>/",
+                        variable=self.group_var, command=self._update_cmd).grid(
+            row=2, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(g2, text="unattended: no prompts, and failed downloads are "
+                                 "retried every minute", variable=self.unatt_var).grid(
+            row=3, column=0, columnspan=3, sticky="w")
+
+        btns = ttk.Frame(f)
+        btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(btns, text="Save", command=self._settings_save).pack(side="left")
+        ttk.Label(btns, text=f"stored in {SETTINGS_PATH}",
+                  foreground="#777").pack(side="left", padx=10)
+
+        for v in (self.dir_var, self.out_var, self.torrent_dir_var, self.base_var):
+            v.trace_add("write", lambda *_a: self._settings_check())
+        self._settings_check()
+
+    def _pick_torrent(self):
+        d = filedialog.askdirectory(initialdir=self.torrent_dir_var.get() or ".")
+        if d:
+            self.torrent_dir_var.set(d)
+
+    def _pick_media(self):
+        d = filedialog.askdirectory(initialdir=self.media_var.get()
+                                    or self.out_var.get() or ".")
+        if d:
+            self.media_var.set(d)
+
+    def _open_media(self):
+        d = Path(self.media_var.get().strip() or "")
+        if not d or not d.exists():
+            self.status_var.set("nothing has been put there yet")
+            return
+        try:
+            os.startfile(str(d))                                    # noqa: B950
+        except AttributeError:
+            os.system(f'xdg-open "{d}"')
+
+    def _pick_s2v(self):
+        f = filedialog.askopenfilename(
+            title="Source2Viewer CLI",
+            initialdir=str(Path(self.s2v_var.get()).parent) if self.s2v_var.get() else ".",
+            filetypes=[("Programs", "*.exe"), ("All files", "*.*")])
+        if not f:
+            return
+        self.s2v_var.set(f)
+        self._proc_tool_note()
+        if "cli" not in Path(f).stem.lower():
+            messagebox.showinfo(
+                APP_NAME,
+                f"{Path(f).name} looks like the Source2Viewer GUI rather than its "
+                f"command line tool.\n\nThe GUI opens whatever it is handed as a "
+                f"file, so it cannot unpack archives from here. The same release "
+                f"ships Source2Viewer-CLI.exe - point this at that instead.")
+
+    def _settings_check(self):
+        """Say what is still missing, while it is still cheap to fix."""
+        if not hasattr(self, "set_note_var"):
+            return
+        save = self.dir_var.get().strip()
+        tor = self.torrent_dir_var.get().strip()
+        bad = []
+        if not self.base():
+            bad.append("no server: the depot list cannot be built without one")
+        if not save:
+            bad.append('"Save to" is empty')
+        elif tor:
+            try:
+                sp, tp = Path(save), Path(tor)
+                if sp == tp or tp in sp.parents:
+                    bad.append('"Save to" is inside the torrent folder - downloading '
+                               "there would collide with qBittorrent, so it is "
+                               "refused. Put it alongside, not inside")
+            except Exception:                                       # noqa: BLE001
+                pass
+        if not self.out_var.get().strip():
+            bad.append('no "Extract to" folder yet - extraction will ask for one')
+        self.set_note_var.set("  -  ".join(bad) if bad else
+                              "all set - the depot list builds itself from here")
+        self.set_note.configure(foreground="#c00000" if bad else "#1a7f37")
+
+    def _settings_save(self):
+        self._save_settings()
+        self._settings_check()
+        self.status_var.set(f"settings saved to {SETTINGS_PATH.name}")
+        # a first run ends here: until now there was nothing to build a list from
+        if self.base() and not self.depot_stats:
+            self._load_depots()
+            self.nb.select(self.depots_tab)
+
+    def _build_process(self, nb):
+        """Turn a finished extraction into plain media files.
+
+        Extraction gives you the game as it shipped: loose files plus .vpk
+        archives. This pulls the parts you can actually open - images, audio,
+        video - into a folder of their own, leaving the build untouched."""
+        f = ttk.Frame(nb, padding=6)
+        nb.add(f, text="Process")
+        self.process_tab = f
+
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        ttk.Label(top, text="Extracted builds:").pack(side="left")
+        ttk.Button(top, text="Rescan", command=self._proc_refresh).pack(side="left", padx=6)
+        ttk.Button(top, text="Open build folder",
+                   command=self._proc_open_build).pack(side="left")
+        ttk.Button(top, text="Open media folder",
+                   command=self._open_media).pack(side="left", padx=6)
+
+        body = ttk.Frame(f)
+        body.pack(fill="both", expand=True, pady=(4, 6))
+        cols = ("depot", "name", "version", "when", "folder")
+        self.ptv = ttk.Treeview(body, columns=cols, show="headings", height=7)
+        for c, w, a in (("depot", 80, "e"), ("name", 220, "w"), ("version", 70, "e"),
+                        ("when", 130, "w"), ("folder", 460, "w")):
+            self.ptv.heading(c, text=c.capitalize())
+            self.ptv.column(c, width=w, anchor=a, stretch=(c == "folder"))
+        psb = ttk.Scrollbar(body, orient="vertical", command=self.ptv.yview)
+        self.ptv.configure(yscrollcommand=psb.set)
+        self.ptv.pack(side="left", fill="both", expand=True)
+        psb.pack(side="left", fill="y")
+
+        opts = ttk.LabelFrame(f, text="What to pull out (one flat folder each)",
+                              padding=8)
+        opts.pack(fill="x")
+        for i, (kind, exts) in enumerate(MEDIA_KINDS.items()):
+            ttk.Checkbutton(opts, text=kind, variable=self.kind_vars[kind]).grid(
+                row=i, column=0, sticky="w")
+            ttk.Label(opts, text=" ".join(exts), foreground="#777").grid(
+                row=i, column=1, sticky="w", padx=8)
+        ttk.Checkbutton(opts, text="also unpack .vpk archives (needs Source2Viewer)",
+                        variable=self.vpk_var).grid(row=3, column=0, columnspan=2,
+                                                    sticky="w", pady=(6, 0))
+        ttk.Label(opts, text="arguments:").grid(row=4, column=0, sticky="w")
+        ttk.Entry(opts, textvariable=self.s2v_args_var).grid(row=4, column=1,
+                                                             sticky="ew", padx=8)
+        opts.columnconfigure(1, weight=1)
+        ttk.Label(opts, foreground="#777", wraplength=900, justify="left",
+                  text=("{input} is each archive, {output} the media folder, {ext} the "
+                        "extensions ticked above. Flags vary between Source2Viewer "
+                        'releases - press "Tool help" to see what yours takes. It is '
+                        "built for Source 2, so on these Source 1 depots it is useful "
+                        "for opening .vpk archives rather than converting what is in "
+                        "them.")).grid(row=5, column=0, columnspan=2, sticky="w",
+                                       pady=(4, 0))
+
+        run = ttk.Frame(f)
+        run.pack(fill="x", pady=6)
+        self.btn_proc = ttk.Button(run, text="Process selected build(s)",
+                                   command=self._proc_run)
+        self.btn_proc.pack(side="left")
+        ttk.Button(run, text="Stop", command=self._proc_stop_now).pack(side="left", padx=6)
+        ttk.Button(run, text="Tool help", command=self._s2v_help).pack(side="left")
+        self.proc_note_var = tk.StringVar()
+        ttk.Label(run, textvariable=self.proc_note_var,
+                  foreground="#555").pack(side="left", padx=10)
+
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True)
+        self.proc_txt = tk.Text(wrap, height=10, wrap="none", font=("Consolas", 9))
+        wsb = ttk.Scrollbar(wrap, orient="vertical", command=self.proc_txt.yview)
+        self.proc_txt.configure(yscrollcommand=wsb.set)
+        self.proc_txt.pack(side="left", fill="both", expand=True)
+        wsb.pack(side="left", fill="y")
+        self._proc_tool_note()
+
+    def _proc_tool_note(self):
+        exe = self.s2v_var.get().strip()
+        if not exe:
+            self.proc_note_var.set("Source2Viewer not set - loose media still works")
+        elif not Path(exe).exists():
+            self.proc_note_var.set(f"Source2Viewer not found at {exe}")
+        elif "cli" not in Path(exe).stem.lower():
+            self.proc_note_var.set(f"{Path(exe).name} - this looks like the GUI, "
+                                   f"not Source2Viewer-CLI.exe")
+        else:
+            self.proc_note_var.set(f"Source2Viewer: {Path(exe).name}")
+
+    def _proc_log(self, msg: str):
+        self.proc_txt.insert("end", msg + "\n")
+        self.proc_txt.see("end")
+        log_to_disk(msg)
+
+    def _proc_refresh(self):
+        """Every extracted build we know of: what was extracted here, plus
+        anything already sitting in the output folder."""
+        rows, seen = [], set()
+        for dep, rec in sorted(self.history.items(), key=lambda kv: int(kv[0])
+                               if kv[0].isdigit() else 0):
+            out = (rec or {}).get("out", "")
+            if out and Path(out).exists():
+                rows.append({"depot": dep, "version": rec.get("version", ""),
+                             "when": rec.get("when", ""), "path": Path(out)})
+                seen.add(str(Path(out)).lower())
+        root = Path(self.out_var.get().strip() or "")
+        try:
+            dirs = sorted(d for d in root.iterdir() if d.is_dir()) if root.exists() else []
+        except OSError:
+            dirs = []
+        for d in dirs:
+            if str(d).lower() in seen or d.name.startswith("_"):
+                continue
+            m = BUILD_RE.match(d.name)
+            rows.append({"depot": m.group(1) if m else "", "version": m.group(3) if m else "",
+                         "when": "", "path": d})
+        self.proc_rows = rows
+        self.ptv.delete(*self.ptv.get_children())
+        for i, r in enumerate(rows):
+            name = self.depot_names.get(r["depot"], "")
+            self.ptv.insert("", "end", iid=str(i), values=(
+                r["depot"], short_name(name) if name else r["path"].name,
+                r["version"], r["when"], str(r["path"])))
+        self.status_var.set(f"{len(rows)} extracted build(s) to process"
+                            if rows else "nothing extracted yet - use the Extract tab first")
+
+    def _proc_selected(self):
+        sel = self.ptv.selection()
+        return self.proc_rows[int(sel[0])] if sel else None
+
+    def _proc_selected_rows(self):
+        """Every build you have selected, in the order they are listed."""
+        return [self.proc_rows[int(i)] for i in sorted(self.ptv.selection(), key=int)
+                if int(i) < len(self.proc_rows)]
+
+    def _proc_open_build(self):
+        r = self._proc_selected()
+        if not r:
+            self.status_var.set("pick a build first")
+            return
+        try:
+            os.startfile(str(r["path"]))                            # noqa: B950
+        except AttributeError:
+            os.system(f'xdg-open "{r["path"]}"')
+
+    def _proc_media_root(self, build: Path) -> Path:
+        """Where this build's media goes: your folder if you set one, else
+        "_media" beside the build - never inside the build itself."""
+        base = self.media_var.get().strip()
+        return (Path(base) / build.name) if base else build.parent / "_media" / build.name
+
+    def _proc_stop_now(self):
+        if not self.proc_busy:
+            return
+        self.proc_stop.set()
+        if self.proc_proc:
+            try:
+                self.proc_proc.terminate()
+            except Exception:                                       # noqa: BLE001
+                pass
+        self._proc_log("stopping this run"
+                       + (f" - {len(self.tasks)} job(s) still queued, use Stop on "
+                          f"the Extract tab to drop those too" if self.tasks else ""))
+
+    def _s2v_help(self):
+        """Print what this build of the tool actually accepts."""
+        exe = self.s2v_var.get().strip()
+        if not exe or not Path(exe).exists():
+            self._proc_log('set "Source2Viewer" on the Settings tab first')
+            return
+        self._proc_log(f"$ {Path(exe).name} --help")
+
+        def work():
+            try:
+                out = subprocess.run([exe, "--help"], capture_output=True, text=True,
+                                     timeout=30, errors="replace",
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                text = (out.stdout or "") + (out.stderr or "")
+            except Exception as exc:                                # noqa: BLE001
+                text = f"could not run it: {exc}"
+            self.after(0, lambda: [self._proc_log(l) for l in text.splitlines()[:80]])
+        threading.Thread(target=work, daemon=True).start()
+
+    def _proc_run(self):
+        """Queue the builds you selected. The options are taken as they are now,
+        so you can queue one build, change the ticks, and queue another."""
+        rows = self._proc_selected_rows()
+        if not rows:
+            self.status_var.set("pick an extracted build first")
+            return
+        kinds = {k for k, v in self.kind_vars.items() if v.get()}
+        exe = self.s2v_var.get().strip()
+        want_vpk = self.vpk_var.get()
+        if want_vpk and (not exe or not Path(exe).exists()):
+            if not self._ask("Source2Viewer isn't set, so .vpk archives will be "
+                             "skipped and only loose media is pulled out.\n\n"
+                             "Carry on?"):
+                return
+            want_vpk = False
+        if not kinds and not want_vpk:
+            self.status_var.set("nothing ticked to pull out")
+            return
+        queued = 0
+        for row in rows:
+            build = row["path"]
+            if not build.exists():
+                self._proc_log(f"{build} is gone - press Rescan")
+                continue
+            self._queue_task({"kind": "process", "path": build,
+                              "kinds": set(kinds), "vpk": want_vpk, "exe": exe,
+                              "args": self.s2v_args_var.get(),
+                              "label": f"process {build.name}"},
+                             quiet=len(rows) > 1)
+            queued += 1
+        if len(rows) > 1:
+            self.status_var.set(f"queued {queued} build(s) to process")
+
+    def _proc_start(self, task: dict):
+        """Run one queued processing job."""
+        build = task["path"]
+        kinds = task["kinds"]
+        exts = {e for k in kinds for e in MEDIA_KINDS[k]}
+        exe, want_vpk, args_tpl = task["exe"], task["vpk"], task["args"]
+        out_root = self._proc_media_root(build)
+        # what the tool unpacks lands here first; the media is lifted out of it
+        stage_root = out_root / "_vpk"
+
+        self.proc_busy = True
+        self.proc_stop.clear()
+        self.btn_proc.config(state="disabled")
+        self._proc_log(f"--- {build.name}: {', '.join(sorted(kinds)) or 'no'} media "
+                       f"-> {out_root}")
+
+        def place(src: Path, kind: str, move: bool = False):
+            """Put one file in its kind's folder, flat.
+
+            Names collide once the folders are gone, so a clash gets _1, _2 ...
+            unless something of that name is already there at the same size -
+            that is this file from an earlier run, and it is left alone."""
+            folder = out_root / kind
+            folder.mkdir(parents=True, exist_ok=True)
+            size = src.stat().st_size
+            stem, ext, n = src.stem, src.suffix, 0
+            while True:
+                dest = folder / (f"{stem}{ext}" if not n else f"{stem}_{n}{ext}")
+                if not dest.exists():
+                    break
+                if dest.stat().st_size == size:
+                    return None
+                n += 1
+            if move:
+                shutil.move(str(src), str(dest))
+            else:
+                shutil.copy2(src, dest)        # the build is left as it was
+            return dest
+
+        def kind_of(ext: str):
+            return next(k for k, v in MEDIA_KINDS.items() if ext in v)
+
+        def work():
+            copied = {k: 0 for k in MEDIA_KINDS}
+            written = skipped = unpacked = 0
+            vpks = []
+            try:
+                out_root.mkdir(parents=True, exist_ok=True)
+                for src in build.rglob("*"):
+                    if self.proc_stop.is_set():
+                        break
+                    if not src.is_file():
+                        continue
+                    ext = src.suffix.lower()
+                    if ext == ".vpk":
+                        if not VPK_PART_RE.search(src.name):
+                            vpks.append(src)
+                        continue
+                    if ext not in exts:
+                        continue
+                    kind = kind_of(ext)
+                    if place(src, kind) is None:
+                        skipped += 1
+                        continue
+                    copied[kind] += 1
+                    written += 1
+                    if written % 200 == 0:
+                        self.after(0, lambda n=written: self.status_var.set(
+                            f"copied {n:,} files ..."))
+            except Exception as exc:                                # noqa: BLE001
+                self.after(0, lambda e=exc: self._proc_log(f"copying stopped: {e}"))
+
+            gui = False
+            for i, vpk in enumerate(vpks, 1):
+                if self.proc_stop.is_set() or not want_vpk:
+                    break
+                stage = stage_root / vpk.stem
+                stage.mkdir(parents=True, exist_ok=True)
+                cmd = [exe] + shlex.split(args_tpl.format(
+                    input=str(vpk), output=str(stage),
+                    ext=",".join(sorted(e.lstrip(".") for e in exts))))
+                self.after(0, lambda v=vpk, i=i: self._proc_log(
+                    f"[{i}/{len(vpks)}] {v.name}"))
+                try:
+                    self.proc_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, errors="replace",
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    for line in self.proc_proc.stdout:
+                        line = line.rstrip()
+                        if not line:
+                            continue
+                        self.after(0, lambda l=line: self._proc_log("   " + l))
+                        if any(sign in line.lower() for sign in S2V_GUI_SIGNS):
+                            gui = True
+                            break
+                    if gui:
+                        # it would sit there with a window open, so stop now
+                        # rather than doing this eleven more times
+                        try:
+                            self.proc_proc.terminate()
+                        except Exception:                           # noqa: BLE001
+                            pass
+                        self.after(0, lambda: self._proc_log(
+                            "   ^ that is the Source2Viewer GUI, not the CLI: it "
+                            "treats every argument as a file to open. Set "
+                            "\"Source2Viewer\" on the Settings tab to "
+                            "Source2Viewer-CLI.exe from the same release "
+                            "(the GUI cannot be driven from here)."))
+                        break
+                    rc = self.proc_proc.wait()
+                    if rc != 0:
+                        self.after(0, lambda r=rc: self._proc_log(
+                            f"   Source2Viewer exited with code {r}"))
+                except FileNotFoundError:
+                    self.after(0, lambda: self._proc_log(
+                        "   could not start Source2Viewer - check the path in Settings"))
+                    break
+                except Exception as exc:                            # noqa: BLE001
+                    self.after(0, lambda e=exc: self._proc_log(f"   {e}"))
+                finally:
+                    self.proc_proc = None
+                # lift what it unpacked into the same three folders; whatever
+                # else it wrote stays in _vpk rather than being thrown away
+                for f in sorted(stage.rglob("*")):
+                    if self.proc_stop.is_set():
+                        break
+                    if not f.is_file() or f.suffix.lower() not in exts:
+                        continue
+                    k = kind_of(f.suffix.lower())
+                    if place(f, k, move=True) is None:
+                        skipped += 1
+                    else:
+                        copied[k] += 1
+                        unpacked += 1
+                try:                        # nothing came out of it: no leftovers
+                    stage.rmdir()
+                except OSError:
+                    pass
+
+            self.after(0, lambda: self._proc_done(copied, skipped, len(vpks),
+                                                  want_vpk and not gui, out_root,
+                                                  unpacked))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _proc_done(self, copied, skipped, nvpk, used_vpk, out_root, unpacked=0):
+        self.proc_busy = False
+        self.btn_proc.config(state="normal")
+        if self.current_task and self.current_task.get("kind") == "process":
+            self.after(0, self._task_step)
+        total = sum(copied.values())
+        parts = [f"{n:,} {k}" for k, n in copied.items() if n]
+        msg = (f"{total:,} file(s) pulled out"
+               + (f" ({', '.join(parts)})" if parts else "")
+               + (f", {skipped:,} already there" if skipped else ""))
+        if nvpk and not used_vpk:
+            msg += (f" - {nvpk} .vpk archive(s) left alone; set Source2Viewer on the "
+                    f"Settings tab to open them")
+        elif nvpk:
+            msg += (f", {nvpk} .vpk archive(s) opened"
+                    + (f" ({unpacked:,} of the files came out of them)"
+                       if unpacked else ""))
+        if self.proc_stop.is_set():
+            msg = "stopped - " + msg
+        self._proc_log(msg)
+        where = ", ".join(str(out_root / k) for k in MEDIA_KINDS if copied.get(k))
+        self._proc_log("they are in " + (where or str(out_root)))
+        self.status_var.set(msg)
+
     # ---- navigation
     def base(self) -> str:
         b = self.base_var.get().strip()
@@ -1693,12 +2555,36 @@ class App(tk.Tk):
             b = "http://" + b
         return b if b.endswith("/") else b + "/"
 
+    def _refresh_servers(self):
+        """Dropdown = the mirrors you listed in mirrors.json, then ones you've used."""
+        seen, values = set(), []
+        for u in list(self.mirrors) + list(self.servers):
+            u = (u or "").strip()
+            if u and u not in seen:
+                seen.add(u)
+                values.append(u)
+        for combo in (getattr(self, "base_combo", None),
+                      getattr(self, "set_combo", None)):
+            try:
+                combo["values"] = values
+            except Exception:                                       # noqa: BLE001
+                pass
+
+    def _remember_server(self):
+        """Called once a server has actually answered, so the list stays useful."""
+        u = self.base()
+        if not u:
+            return
+        self.servers = [u] + [s for s in self.servers if s != u]
+        del self.servers[8:]
+        self._refresh_servers()
+
     def _need_base(self) -> bool:
         """Nothing can be fetched until you say where from."""
         if self.base():
             return True
-        self.status_var.set('set the "Server" field at the top first, '
-                            "then try again")
+        self.status_var.set('no server yet - set one on the Settings tab (or in '
+                            'the "Server" box at the top), then try again')
         return False
 
     def url_for(self, path: str) -> str:
@@ -1732,6 +2618,8 @@ class App(tk.Tk):
         self.cur_entries = entries
         self.path_var.set("/" + path)
         self._apply_filter()
+        if entries:
+            self._remember_server()           # it answered, so keep it on the list
 
     def _go_up(self):
         p = self.cur_path.rstrip("/")
@@ -1790,7 +2678,7 @@ class App(tk.Tk):
                          if files else "")
 
     # ---- queueing
-    def _job_for(self, path: str, name: str, size: int) -> Job:
+    def _job_for(self, path: str, name: str, size: int, approx: bool = False) -> Job:
         remote = (path + "/" + name) if path else name      # always flat on the server
         m = NAME_RE.match(name)
         local = remote
@@ -1798,7 +2686,8 @@ class App(tk.Tk):
             local = f"{path}/{m.group(1)}/{name}"           # blobs/852/852_0_....blob
         return Job(url=self.url_for(remote),
                    rel=os.path.join(*[safe_name(p) for p in local.split("/")]),
-                   size=size, sha256=m.group(4).lower() if m else "")
+                   size=size, sha256=m.group(4).lower() if m else "",
+                   approx=approx)
 
     def _enqueue(self, jobs, urgent: bool = False):
         """Queue these. Returns the job objects now being tracked, which for a
@@ -1821,7 +2710,7 @@ class App(tk.Tk):
 
     def _add_selected(self):
         sel = [self.filtered[int(i)] for i in self.tv.selection()]
-        self._enqueue([self._job_for(self.cur_path, e.name, e.size)
+        self._enqueue([self._job_for(self.cur_path, e.name, e.size, e.approx)
                        for e in sel if not e.is_dir])
 
     def _add_filtered(self):
@@ -1830,7 +2719,7 @@ class App(tk.Tk):
                 APP_NAME, f"Queue {len(files):,} files "
                           f"({human(sum(e.size for e in files))})?"):
             return
-        self._enqueue([self._job_for(self.cur_path, e.name, e.size) for e in files])
+        self._enqueue([self._job_for(self.cur_path, e.name, e.size, e.approx) for e in files])
 
     def _quick(self, names):
         try:
@@ -1838,8 +2727,8 @@ class App(tk.Tk):
         except Exception as exc:                                    # noqa: BLE001
             self._fail(str(exc))
             return
-        sizes = {e.name: e.size for e in root}
-        self._enqueue([self._job_for("", n, sizes.get(n, 0)) for n in names if n in sizes])
+        sizes = {e.name: (e.size, e.approx) for e in root}
+        self._enqueue([self._job_for("", n, *sizes[n]) for n in names if n in sizes])
 
     def _add_extractor(self):
         try:
@@ -1847,7 +2736,7 @@ class App(tk.Tk):
         except Exception as exc:                                    # noqa: BLE001
             self._fail(str(exc))
             return
-        self._enqueue([self._job_for("extractor", e.name, e.size)
+        self._enqueue([self._job_for("extractor", e.name, e.size, e.approx)
                        for e in entries if not e.is_dir])
 
     def _on_tab_changed(self, _e=None):
@@ -1861,19 +2750,35 @@ class App(tk.Tk):
             self._refresh_local()                    # recount in the background
         elif cur is getattr(self, "mirror_tab", None) and not self.mirror_job:
             self._mirror_refresh()
+        elif cur is getattr(self, "process_tab", None) and not self.proc_busy:
+            self._proc_refresh()
 
     # ---- depot index
+    def _autoload_depots(self):
+        """Build the depot list on startup, without being asked.
+
+        It is the tab the app opens on, so an empty one is just a button you
+        always have to press. Cached listings make this instant; the first run
+        on a new server fetches them, in the background, with the status line
+        saying so."""
+        if self.depot_stats or not self.base():
+            return
+        self._load_depots()
+
     def _load_depots(self, refresh: bool = False):
         if not self._need_base():
             return
         self.status_var.set("re-downloading both file listings ..." if refresh else
                             "building the depot list from the file listings ...")
         self.update_idletasks()
+        # read on this thread: Tk variables belong to the thread running the UI,
+        # and this one now starts by itself before anything is on screen
+        base = self.base()
 
         def work():
             try:
-                blobs = self.listing.get(self.base() + "blobs/", refresh)
-                dats = self.listing.get(self.base() + "dats/", refresh)
+                blobs = self.listing.get(base + "blobs/", refresh)
+                dats = self.listing.get(base + "dats/", refresh)
             except Exception as exc:                                # noqa: BLE001
                 self.after(0, lambda e=exc: self._fail(str(e)))
                 return
@@ -1897,7 +2802,7 @@ class App(tk.Tk):
                 d.pop("versions")
                 rows.append(d)
             # if a refresh silently fell back to cache, the age gives it away
-            stale = refresh and (self.listing.age(self.base() + "blobs/") or 0) > 120
+            stale = refresh and (self.listing.age(base + "blobs/") or 0) > 120
             self.after(0, lambda: self._depots_loaded(rows, stale))
         threading.Thread(target=work, daemon=True).start()
 
@@ -2066,6 +2971,8 @@ class App(tk.Tk):
 
     def _depots_loaded(self, rows, stale: bool = False):
         self.depot_stats = rows
+        if rows:
+            self._remember_server()           # it answered, so keep it on the list
         self._show_depots()
         total = sum(r["total"] for r in rows)
         note = " - refresh failed, showing the cached list" if stale else ""
@@ -2342,6 +3249,40 @@ class App(tk.Tk):
             pass
         self._qb_fill(tors)
 
+    def _qb_add_webseed(self):
+        """Attach the mirror to the torrent as an HTTP source."""
+        url = self.qb_webseed_var.get().strip()
+        if not url:
+            url = self.base()                  # fall back to the server in use
+            self.qb_webseed_var.set(url)
+        if not url:
+            self._qb_log("no web seed URL - type one, or set the Server first")
+            return
+        if "://" not in url:
+            self._qb_log(f"'{url}' is not a URL - it needs http:// or https://")
+            return
+        if not (self.qb and self.qb_hash):
+            messagebox.showinfo(APP_NAME, "Connect and pick the torrent first.")
+            return
+        thash = self.qb_hash
+
+        def work():
+            try:
+                have = self.qb.web_seeds(thash)
+                if any(u.rstrip("/") == url.rstrip("/") for u in have):
+                    msg = f"{url} is already a web seed on this torrent"
+                else:
+                    self.qb.add_web_seeds(thash, [url])
+                    now = self.qb.web_seeds(thash)
+                    msg = (f"added {url} as a web seed ({len(now)} in total)"
+                           if any(u.rstrip("/") == url.rstrip("/") for u in now)
+                           else f"qBittorrent accepted the call but {url} is not "
+                                f"listed - check the torrent's properties")
+            except QBitError as exc:
+                msg = f"could not add the web seed: {exc}"
+            self.after(0, lambda: (self._qb_log(msg), self.status_var.set(msg)))
+        threading.Thread(target=work, daemon=True).start()
+
     def _qb_load_torrents(self):
         if not self.qb:
             self._qb_log("connect first")
@@ -2428,6 +3369,9 @@ class App(tk.Tk):
         self.dmenu.entryconfig(7, label=f"Queue HTTP download ({one})")
         self.dmenu.entryconfig(8, state="normal" if n == 1 and sel[0] in self.history
                                else "disabled")
+        self.dmenu.entryconfig(11, label="Delete this depot's dats (keep blobs)"
+                               if n == 1 else f"Delete the dats of {n} depots "
+                                              f"(keep blobs)")
         self.dmenu.tk_popup(e.x_root, e.y_root)
 
     def _selected_depots(self):
@@ -2438,50 +3382,107 @@ class App(tk.Tk):
         deps = self._selected_depots()
         if not deps:
             return
-        if self.ext.busy or self.pipe or self.batch:
-            messagebox.showinfo(APP_NAME, "Already busy - wait for it, or press Stop "
-                                          "on the Extract tab.")
-            return
         if len(deps) > 1 and not messagebox.askyesno(
                 APP_NAME,
-                f"Extract {len(deps)} depots, newest version of each, one after "
-                f"another?\n\nAnything missing is fetched first (from the torrent "
-                f"if it can be), and you won't be asked again per depot."):
+                f"Queue {len(deps)} depots, newest version of each?\n\nThey run "
+                f"one after another. Anything missing is fetched first (from the "
+                f"torrent if it can be), and you won't be asked again per depot."):
             return
-        self.batch = list(deps)
-        self.batch_total = len(deps)
+        for dep in deps:
+            self._queue_task({"kind": "extract", "depot": dep, "version": None,
+                              "download": True,
+                              "label": f"extract depot {dep} (newest)"}, quiet=True)
         self.nb.select(self.extract_tab)
-        self._batch_next()
+        self.status_var.set(f"queued {len(deps)} extraction(s)")
 
-    def _batch_next(self):
-        """Start the next depot in the batch, or report that it's finished."""
-        self.batch_pending = False
-        if not self.batch:
-            if self.batch_total > 1:
-                self._log(f"=== batch finished: {self.batch_total} depots ===")
-                self.status_var.set(f"batch finished - {self.batch_total} depots")
-                self.bell()
-            self.batch_total = 0
+    # ---- the task queue: extractions and processing runs, one at a time
+    def _queue_task(self, task: dict, quiet: bool = False):
+        """Add a long job to the queue, and start it if nothing else is running.
+
+        Extraction and processing both take minutes and both write to the same
+        folders, so they share one queue instead of racing each other."""
+        task.setdefault("status", "queued")
+        self.tasks.append(task)
+        self.task_total += 1
+        self._render_tasks()
+        if not quiet:
+            waiting = len(self.tasks) - (0 if self.current_task else 1)
+            self.status_var.set(
+                task["label"] + (f" - queued, {waiting} ahead of it"
+                                 if waiting > 0 else " - starting"))
+        if not self.current_task:
+            self._task_next()
+        return task
+
+    def _task_next(self):
+        """Start the next job, or report that the queue has run dry."""
+        self.task_pending = False
+        if self.current_task:                  # something is still going
             return
-        dep = self.batch.pop(0)
-        left = len(self.batch)
+        if not self.tasks:
+            if self.task_total > 1:
+                self._log(f"=== queue finished: {self.task_total} job(s) ===")
+                self.status_var.set(f"queue finished - {self.task_total} jobs")
+                self.bell()
+            self.task_total = 0
+            self._render_tasks()
+            return
+        task = self.tasks.pop(0)
+        self.current_task = task
+        task["status"] = "running"
+        self._render_tasks()
+        left = len(self.tasks)
         self._log("")
-        self._log(f"=== depot {dep}" + (f", {left} more after this ===" if left else " ==="))
-        self._ensure_depot_rows(dep, self._extract_from_picker)
+        self._log(f"=== {task['label']}"
+                  + (f", {left} more queued ===" if left else " ==="))
+        if task["kind"] == "process":
+            self._proc_start(task)
+        else:
+            self._ensure_depot_rows(task["depot"], lambda: self._begin_extract(task))
 
-    def _batch_step(self):
-        """One depot ended, however it ended - move the batch along."""
-        if (self.batch or self.batch_total) and not self.batch_pending:
-            self.batch_pending = True
-            self.after(1200, self._batch_next)
+    def _task_step(self):
+        """Whatever was running has ended, however it ended - move along."""
+        self.current_task = None
+        self._render_tasks()
+        if (self.tasks or self.task_total) and not self.task_pending:
+            self.task_pending = True
+            self.after(1200, self._task_next)
 
-    def _batch_running(self) -> bool:
-        return bool(self.batch) or self.batch_total > 1
+    def _tasks_running(self) -> bool:
+        return bool(self.tasks) or self.task_total > 1
+
+    def _render_tasks(self):
+        if not hasattr(self, "ttv"):
+            return
+        self.ttv.delete(*self.ttv.get_children())
+        rows = ([self.current_task] if self.current_task else []) + list(self.tasks)
+        for i, t in enumerate(rows):
+            self.ttv.insert("", "end", iid=str(i),
+                            values=(t["kind"], t["label"], t.get("status", "queued")),
+                            tags=("run",) if t.get("status") == "running" else ())
+        self.task_note_var.set(f"{len(self.tasks)} waiting" if self.tasks else
+                               ("running" if self.current_task else "nothing queued"))
+
+    def _remove_tasks(self):
+        """Drop the selected jobs. The one already running is left alone - use
+        Stop for that."""
+        rows = ([self.current_task] if self.current_task else []) + list(self.tasks)
+        drop = {id(rows[int(i)]) for i in self.ttv.selection()
+                if int(i) < len(rows) and rows[int(i)] is not self.current_task}
+        if not drop:
+            self.status_var.set("pick queued job(s) to remove - Stop cancels the "
+                                "one that is running")
+            return
+        self.tasks = [t for t in self.tasks if id(t) not in drop]
+        self.task_total = max(1, self.task_total - len(drop)) if self.tasks or \
+            self.current_task else 0
+        self._render_tasks()
+        self.status_var.set(f"removed {len(drop)} queued job(s)")
 
     def _ask(self, msg: str) -> bool:
         """Confirmations, minus the ones you've already answered for a whole
         batch or turned off with unattended mode."""
-        if self._batch_running() or self.unatt_var.get():
+        if self._tasks_running() or self.unatt_var.get():
             return True
         return messagebox.askyesno(APP_NAME, msg)
 
@@ -2691,6 +3692,149 @@ class App(tk.Tk):
             self.qb.resume(self.qb_hash)
         return ids, already, missing, todo
 
+    def _dat_paths_for(self, deps) -> list:
+        """Every .dat of these depots that is on disk, in either folder.
+
+        Blobs are never included: they are kilobytes, they hold the manifest,
+        and losing them would take the depot out of the list entirely."""
+        want, out, seen = set(deps), [], set()
+        for root in (self._torrent_root(), Path(self.dir_var.get().strip() or "")):
+            if not root:
+                continue
+            for name, path in self._scan_files(root).items():
+                m = NAME_RE.match(name)
+                if not (m and name.endswith(".dat") and m.group(1) in want):
+                    continue
+                key = str(path).lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(path)
+        return out
+
+    def _delete_dats(self):
+        """Reclaim the space a depot's dats take, once you have extracted it.
+
+        The dats are the whole weight of a depot; the blobs are kilobytes. This
+        marks them "do not download" in the torrent first - otherwise
+        qBittorrent would simply fetch them again - and only then deletes them.
+        It is the one place the app removes anything from the torrent folder,
+        so it always asks, even in unattended mode."""
+        deps = self._selected_depots()
+        if not deps:
+            return
+        paths = self._dat_paths_for(deps)
+        on_disk = 0
+        for pth in paths:
+            try:
+                on_disk += pth.stat().st_size
+            except OSError:
+                pass
+        want = set(deps)
+        ids, marked = [], 0
+        if self.qb and self.qb_hash and self.qb_index:
+            for name, f in self.qb_index.items():
+                m = NAME_RE.match(name)
+                if m and name.endswith(".dat") and m.group(1) in want:
+                    ids.append(f["index"])
+                    marked += 1
+        if not paths and not ids:
+            self.status_var.set("no dats of those depots anywhere on disk")
+            return
+
+        who = f"depot {deps[0]}" if len(deps) == 1 else f"{len(deps)} depots"
+        lines = [f"Delete the dats of {who}?", ""]
+        if paths:
+            lines.append(f"{len(paths):,} file(s) on disk, {human(on_disk)} freed.")
+        else:
+            lines.append("Nothing is on disk yet.")
+        if ids:
+            lines.append(f'{marked:,} file(s) in the torrent will be set to "do not '
+                         f'download" first, so qBittorrent does not fetch them again.')
+        else:
+            lines.append("qBittorrent is not connected, so nothing can be marked - "
+                         "the torrent will download them again unless you connect "
+                         "first and repeat this.")
+        lines += ["", "The blobs are kept, so the depot stays listed and its file "
+                      "list can still be previewed. Extracting it later means "
+                      "fetching the dats again.", "", "This cannot be undone."]
+        if not messagebox.askyesno(APP_NAME, "\n".join(lines)):
+            return
+
+        # nothing queued should quietly put them back
+        names = {pth.name for pth in paths}
+        drop = {id(j) for j in self.dl.jobs
+                if j.status != STATUS_ACTIVE and Path(j.rel).name in names}
+        if drop:
+            with self.dl.lock:
+                self.dl.jobs = [j for j in self.dl.jobs if id(j) not in drop]
+                self.dl.dirty = set(range(len(self.dl.jobs)))
+            self._sync_queue_rows()
+        self.status_var.set(f"deleting the dats of {who} ...")
+
+        def work():
+            was_running = False
+            if ids:
+                # stop it first: it must not be writing to these while their
+                # priority changes, and Windows will not delete a file it holds
+                _ok, was_running = self._qb_hold("the deletion")
+                try:
+                    self.qb.set_priority(self.qb_hash, ids, QBit.PRIO_SKIP)
+                except QBitError as exc:
+                    self.after(0, lambda e=exc: (
+                        self._log(f"qBittorrent would not mark the files: {e}"),
+                        self._qb_release(was_running),
+                        self.status_var.set(f"nothing deleted - qBittorrent refused: {e}")))
+                    return
+                time.sleep(1.5)
+            gone = freed = 0
+            errs = []
+            for pth in paths:
+                try:
+                    n = pth.stat().st_size
+                    pth.unlink()
+                    gone += 1
+                    freed += n
+                except OSError as exc:
+                    errs.append(f"{pth.name}: {exc}")
+            self.after(0, lambda: self._dats_deleted(who, gone, freed, marked, errs,
+                                                     bool(ids), was_running))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _dats_deleted(self, who, gone, freed, marked, errs, held=False,
+                      was_running=False):
+        msg = f"{who}: {gone:,} dat(s) deleted, {human(freed)} freed"
+        if marked:
+            msg += f", {marked:,} marked \"do not download\""
+        if errs:
+            msg += f", {len(errs)} could not be removed"
+            for line in errs[:10]:
+                self._log("could not delete " + line)
+            if len(errs) > 10:
+                self._log(f"... and {len(errs) - 10} more")
+            self._log("files still open are usually held by qBittorrent - pause the "
+                      "torrent and try again")
+        if held:
+            msg += self._qb_release(was_running)
+        self._log(msg)
+        self.status_var.set(msg)
+        self._local_cache = None            # "You have" has just changed
+        self._refresh_local()
+        if self.qb and self.qb_hash:        # so the Mirror tab and the menus agree
+            self._qb_reload_files()
+
+    def _qb_reload_files(self):
+        """Re-read the torrent's file list after we have changed it."""
+        if not (self.qb and self.qb_hash):
+            return
+
+        def work():
+            try:
+                files = self.qb.files(self.qb_hash)
+            except QBitError:
+                return
+            self.after(0, lambda: self._qb_indexed(files))
+        threading.Thread(target=work, daemon=True).start()
+
     def _http_queue_depots(self):
         deps = self._selected_depots()
         if not deps:
@@ -2700,7 +3844,7 @@ class App(tk.Tk):
         self.status_var.set(f"looking up {len(deps)} depot(s) ...")
 
         def got(entries):
-            jobs = [self._job_for(kind, en.name, en.size) for kind, en in entries]
+            jobs = [self._job_for(kind, en.name, en.size, en.approx) for kind, en in entries]
             if not jobs:
                 self.status_var.set("nothing found for those depots")
                 return
@@ -2736,19 +3880,88 @@ class App(tk.Tk):
         self.mirror_rows = rows
         self.qb_index.update({Path(f["name"].replace("\\", "/")).name: f
                               for f in files})
+        self._mirror_render()
+
+    @staticmethod
+    def _mirror_base(f) -> str:
+        """The plain filename, whichever separator the torrent used."""
+        return f["name"].replace(chr(92), "/").rsplit("/", 1)[-1]
+
+    def _mirror_select_zero(self):
+        """Select every file the torrent hasn't started - usually what you want
+        to mirror, since half-finished ones are already moving."""
+        zero = [str(i) for i, f in enumerate(self.mirror_rows)
+                if not f.get("progress", 0)]
+        self.mtv.selection_set(*zero) if zero else self.mtv.selection_remove(
+            *self.mtv.get_children())
+        if zero:
+            self.mtv.see(zero[0])
+        if not zero:
+            self.mirror_status_var.set("nothing is at 0% - the torrent has "
+                                       "started them all")
+            return
+        self._mirror_selection_note()
+
+    def _mirror_selection_note(self, _e=None):
+        """Say what a run would cost before anyone commits to it."""
+        if self.mirror_job:
+            return                             # the poll owns the status line
+        try:
+            sizes = [self.mirror_rows[int(i)].get("size", 0)
+                     for i in self.mtv.selection()]
+        except (ValueError, IndexError):
+            return
+        if not sizes:
+            self._mirror_render()              # back to the file count
+            return
+        secs = mirror_eta(sizes, self.rate_agg, self.rate_conn)
+        note = (f"roughly {duration(secs)} at the speed you're getting"
+                if secs else "no download speed measured yet, so no estimate")
+        self.mirror_status_var.set(
+            f"{len(sizes):,} selected, {human(sum(sizes))} - "
+            f"{note}, torrent paused throughout")
+
+    def _sort_mirror(self, col):
+        same = self.msort[0] == col
+        self.msort = (col, not self.msort[1] if same else False)
+        self._mirror_render()
+
+    def _mirror_render(self):
+        """Draw the list in the chosen order.
+
+        Row ids stay the index into mirror_rows, so re-sorting never disturbs
+        what you have selected or which files a download would fetch."""
+        def depot_of(f):
+            m = NAME_RE.match(self._mirror_base(f))
+            return int(m.group(1)) if m else -1
+
+        def remaining(f):
+            return f.get("size", 0) * (1 - f.get("progress", 0))
+
+        key = {"name": self._mirror_base, "depot": depot_of,
+               "size": lambda f: f.get("size", 0),
+               "got": lambda f: f.get("progress", 0), "left": remaining,
+               "prio": lambda f: f.get("priority", 0)}[self.msort[0]]
+        rows = self.mirror_rows
+        order = sorted(range(len(rows)), key=lambda i: key(rows[i]),
+                       reverse=self.msort[1])
+        keep = set(self.mtv.selection())
         self.mtv.delete(*self.mtv.get_children())
         label = {QBit.PRIO_SKIP: "skip", QBit.PRIO_NORMAL: "normal",
                  QBit.PRIO_HIGH: "high", QBit.PRIO_MAX: "maximum"}
         left = 0
-        for i, f in enumerate(rows):
-            n = Path(f["name"].replace("\\", "/")).name
+        for i in order:
+            f = rows[i]
+            n = self._mirror_base(f)
             m = NAME_RE.match(n)
             size, prog = f.get("size", 0), f.get("progress", 0)
             left += size - size * prog
             self.mtv.insert("", "end", iid=str(i), values=(
-                n, m.group(1) if m else "-", human(size), f"{prog * 100:.0f}%",
+                n, m.group(1) if m else "-", human(size), bar(prog),
                 human(size - size * prog),
                 label.get(f.get("priority"), f.get("priority"))))
+        if keep:
+            self.mtv.selection_set(*[i for i in keep if self.mtv.exists(i)])
         msg = f"{len(rows):,} unfinished files, {human(left)} still to fetch"
         if getattr(self, "_mirror_note", ""):
             msg = f"{self._mirror_note}  |  {msg}"
@@ -2768,35 +3981,69 @@ class App(tk.Tk):
             return
         if not self._need_base() or not self._writable_save_dir():
             return
+        if not self.qb_save_path:
+            self.mirror_status_var.set("qBittorrent hasn't told us where the "
+                                       "torrent lives - press Connect again")
+            return
+        root = Path(self.qb_save_path)
         jobs = []
         for f in sel:
-            n = Path(f["name"].replace("\\", "/")).name
+            n = self._mirror_base(f)
             kind = ("blobs" if n.endswith(".blob") else
                     "dats" if n.endswith(".dat") else "")
-            if kind:
-                jobs.append(self._job_for(kind, n, f.get("size", 0)))
+            if not kind:
+                continue
+            j = self._job_for(kind, n, f.get("size", 0))
+            # straight into the torrent's own file: qBittorrent can then verify
+            # and seed it, and the extractor finds it where it always looks
+            rel = f["name"].replace(chr(92), "/")
+            j.dest = str(root / rel)
+            j.rel = rel                      # what the queue shows
+            j.overwrite = True               # replace qB's partial copy at the end
+            jobs.append(j)
         if not jobs:
             self.mirror_status_var.set("none of those are blobs or dats")
             return
         total = sum(j.size for j in jobs)
+        biggest = max(j.size for j in jobs)
+        secs = mirror_eta([j.size for j in jobs], self.rate_agg, self.rate_conn)
+        if secs is None:
+            estimate = ("\n\nNo speed measured on this mirror yet, so there is "
+                        "no estimate. Mirrors differ enormously - the status bar "
+                        "will show the real rate once it starts.")
+        else:
+            estimate = f"\n\nEstimated {duration(secs)} at the speed you're getting."
+            if secs > 20 * 60:
+                estimate += ("\n\nThe torrent stays paused for all of it.")
+                if self.rate_conn > 0 and biggest / self.rate_conn > 20 * 60:
+                    estimate += (
+                        f"\n\nThe largest file here is {human(biggest)}, and one "
+                        f"file only ever gets one connection "
+                        f"({human_speed(self.rate_conn)} so far), so extra threads "
+                        f"cannot speed it up. The torrent may be the better route "
+                        f"for something that big.")
         if not self._ask(f"Fetch {len(jobs)} file(s) ({human(total)}) from the "
-                         f"server instead of waiting for the torrent?"):
+                         f"server instead of waiting for the torrent?{estimate}"):
             return
         if not self._space_ok(total):
             return
 
-        paused = False
-        if self.mirror_pause_var.get():
-            try:
-                paused = self.qb.pause(self.qb_hash)
-            except QBitError as exc:
-                self._qb_log(f"could not pause the torrent: {exc}")
-            self._qb_log("torrent paused for the mirror download" if paused else
-                         "could not pause the torrent - carrying on anyway")
+        # These files belong to the torrent, so qBittorrent must not be writing
+        # to them while we do. Pausing is not optional here.
+        paused, was_running = self._qb_hold("the mirror download")
+        if not paused:
+            messagebox.showwarning(
+                APP_NAME,
+                "Could not pause the torrent, and these files belong to it - "
+                "letting qBittorrent write to them at the same time risks "
+                "corrupting them.\n\nPause it yourself in qBittorrent, then try "
+                "again.")
+            self.mirror_status_var.set("not started - the torrent would not pause")
+            return
         # track whatever the queue actually holds for these URLs, and let them
         # jump ahead of any backlog - the torrent is paused until they finish
         self.mirror_job = {"jobs": self._enqueue(jobs, urgent=True) or jobs,
-                           "paused": paused}
+                           "paused": paused, "was_running": was_running}
         self._start()
         self.btn_mirror.config(state="disabled")
         self.mirror_status_var.set(
@@ -2807,6 +4054,16 @@ class App(tk.Tk):
         if not self.mirror_job:
             return
         jobs = self.mirror_job["jobs"]
+        total = sum(j.size for j in jobs)
+        got = sum(j.size if j.status in (STATUS_DONE, STATUS_SKIP) else j.done
+                  for j in jobs)
+        self.mirror_pbar.config(maximum=max(1, total), value=got)
+        done = sum(1 for j in jobs
+                   if j.status not in (STATUS_QUEUED, STATUS_ACTIVE))
+        speed = sum(j.speed for j in jobs if j.status == STATUS_ACTIVE)
+        self.mirror_status_var.set(
+            f"mirroring {done}/{len(jobs)} file(s), {human(got)} of "
+            f"{human(total)}" + (f" at {human_speed(speed)}" if speed else ""))
         if any(j.status in (STATUS_QUEUED, STATUS_ACTIVE) for j in jobs):
             self.after(1000, self._mirror_poll)
             return
@@ -2815,33 +4072,69 @@ class App(tk.Tk):
     def _mirror_finished(self):
         job, self.mirror_job = self.mirror_job, None
         self.btn_mirror.config(state="normal")
+        self.mirror_pbar.config(value=0)
         done = [j for j in job["jobs"] if j.status in (STATUS_DONE, STATUS_SKIP)]
         msg = f"mirrored {len(done)}/{len(job['jobs'])} file(s)"
         if len(done) < len(job["jobs"]):
             msg += f", {len(job['jobs']) - len(done)} failed"
         self._local_cache = None
 
-        if done and self.mirror_skip_var.get() and self.qb and self.qb_hash:
-            ids = [self.qb_index[n]["index"]
-                   for n in (Path(j.rel).name for j in done)
-                   if n in self.qb_index]
+        # The files are in the torrent's own layout now, but qBittorrent still
+        # believes they are missing - only a recheck changes its mind.
+        rechecked = False
+        if done and self.mirror_recheck_var.get() and self.qb and self.qb_hash:
             try:
-                self.qb.set_priority(self.qb_hash, ids, QBit.PRIO_SKIP)
-                self._qb_log(f"set {len(ids)} mirrored file(s) to 'do not download'")
-                msg += f", {len(ids)} now skipped in qBittorrent"
+                self.qb.recheck(self.qb_hash)
+                rechecked = True
+                self._qb_log("recheck started - qBittorrent is verifying the "
+                             "mirrored files")
+                msg += ", rechecking"
             except QBitError as exc:
-                self._qb_log(f"could not change priorities: {exc}")
+                self._qb_log(f"could not start a recheck: {exc}")
 
         if job["paused"]:
-            try:
-                self.qb.resume(self.qb_hash)
-                self._qb_log("torrent resumed")
-                msg += ", torrent resumed"
-            except QBitError as exc:
-                self._qb_log(f"could NOT resume the torrent: {exc}")
-                msg += " - COULD NOT RESUME THE TORRENT, do it in qBittorrent"
+            msg += self._qb_release(job.get("was_running", True))
+        if done and not rechecked:
+            msg += " - recheck the torrent in qBittorrent to have it count them"
         self._log(msg)
         self._mirror_refresh(msg)
+
+    def _qb_hold(self, why: str):
+        """Stop the torrent while we touch its files.
+
+        Returns (ok, was_running). A torrent you had already stopped is left
+        stopped afterwards - we only ever put it back the way we found it."""
+        try:
+            state = self.qb.state(self.qb_hash)
+        except QBitError as exc:
+            state = ""
+            self._qb_log(f"could not read the torrent's state ({exc}) - "
+                         f"assuming it was running")
+        if state and not QBit.is_running(state):
+            self._qb_log(f"torrent is already stopped ({state}) - it will be left "
+                         f"that way after {why}")
+            return True, False
+        try:
+            ok = self.qb.pause(self.qb_hash)
+        except QBitError as exc:
+            self._qb_log(f"could not pause the torrent: {exc}")
+            return False, True
+        if ok:
+            self._qb_log(f"torrent paused for {why}")
+        return ok, True
+
+    def _qb_release(self, was_running: bool) -> str:
+        """Undo _qb_hold. Says what happened, for the status line."""
+        if not was_running:
+            self._qb_log("torrent left stopped - it was not running before")
+            return ", torrent left stopped (it was not running before)"
+        try:
+            self.qb.resume(self.qb_hash)
+            self._qb_log("torrent resumed")
+            return ", torrent resumed"
+        except QBitError as exc:
+            self._qb_log(f"could NOT resume the torrent: {exc}")
+            return " - COULD NOT RESUME THE TORRENT, do it in qBittorrent"
 
     def _qb_torrent_dirs(self):
         """Locate the torrent's blobs/ and dats/ folders on disk."""
@@ -3125,42 +4418,92 @@ class App(tk.Tk):
                 return root / "extractor" / "extract.exe"
         return None
 
+    def _picker_version(self):
+        """The version the picker is pointed at: the row you selected if you
+        selected one, otherwise whatever the Version box says."""
+        sel = self.dtv.selection()
+        if sel:
+            picked = [self.depot_rows[int(i)]["version"] for i in sel
+                      if int(i) < len(self.depot_rows)]
+            if picked:
+                return max(picked)
+        v = self.maxver_var.get().strip()
+        return int(v) if v.isdigit() else max(r["version"] for r in self.depot_rows)
+
+    def _picker_crc(self, ver: int) -> str:
+        """--blobcrc, needed only when a reset put two blobs on one version."""
+        chain = [r for r in self.depot_rows if r["version"] <= ver]
+        if not any(len(r["blobs"]) > 1 for r in chain):
+            return ""
+        target = next((r for r in chain if r["version"] == ver), None)
+        return target["blobs"][0][0] if target and target["blobs"] else ""
+
+    def _on_pick_version(self, _e=None):
+        """Selecting a version in the picker points everything at that version."""
+        sel = self.dtv.selection()
+        if not sel or not self.depot_rows:
+            return
+        picked = [self.depot_rows[int(i)]["version"] for i in sel
+                  if int(i) < len(self.depot_rows)]
+        if picked:
+            self.maxver_var.set(str(max(picked)))
+
     def _extract_from_picker(self):
-        """Depot picker -> fill in the Extract tab and run the whole thing."""
+        """Depot picker -> queue the version you picked, and its chain."""
         if not self.depot_rows or not self.depot_id:
             messagebox.showinfo(APP_NAME, "Scan a depot first.")
             return
         dep = self.depot_id
-        v = self.maxver_var.get().strip()
-        ver = int(v) if v.isdigit() else max(r["version"] for r in self.depot_rows)
-        chain = [r for r in self.depot_rows if r["version"] <= ver]
-        crc = ""
-        if any(len(r["blobs"]) > 1 for r in chain):
-            target = next((r for r in chain if r["version"] == ver), None)
-            if target and target["blobs"]:
-                crc = target["blobs"][0][0]
-        self.edepot_var.set(dep)
-        self.ever_var.set(str(ver))
-        self.ecrc_var.set(crc)
+        ver = self._picker_version()
+        if not any(r["version"] == ver for r in self.depot_rows):
+            messagebox.showinfo(APP_NAME, f"Depot {dep} has no version {ver}. Pick "
+                                          f"one from the list, or type one that exists.")
+            return
         if not self.out_var.get().strip():
             self.out_var.set(str(Path(self.dir_var.get().strip() or ".") / "extracted"))
+        self._queue_task({"kind": "extract", "depot": dep, "version": ver,
+                          "download": True,
+                          "label": f"extract depot {dep} v{ver}"})
         self.nb.select(self.extract_tab)
-        self._go_extract()
 
     def _go_extract(self, download: bool = True):
-        if self.ext.busy or self.pipe:
-            messagebox.showinfo(APP_NAME, "Already busy - wait for it to finish or press Stop.")
-            return
+        """The Extract tab's own buttons: queue what the fields say."""
         dep, v = self.edepot_var.get().strip(), self.ever_var.get().strip()
         if not dep.isdigit() or not v.isdigit():
             messagebox.showinfo(APP_NAME, "Set a depot id and a version first.")
             return
         if not self.out_var.get().strip():
             self.out_var.set(str(Path(self.dir_var.get().strip() or ".") / "extracted"))
-        if not download:
+        self._queue_task({"kind": "extract", "depot": dep, "version": int(v),
+                          "download": download, "crc": self.ecrc_var.get().strip(),
+                          "filter": self.efilter_var.get().strip(),
+                          "label": f"extract depot {dep} v{v}"
+                                   + ("" if download else " (no download)")})
+
+    def _begin_extract(self, task: dict):
+        """Run one queued extraction: the depot's rows are loaded by now."""
+        dep = task["depot"]
+        ver = task.get("version")
+        if ver is None:                       # "newest", resolved once we can see
+            ver = max((r["version"] for r in self.depot_rows), default=None)
+            if ver is None:
+                self._log(f"depot {dep}: nothing to extract")
+                self._task_step()
+                return
+            task["version"] = ver
+            task["label"] = f"extract depot {dep} v{ver}"
+            self._render_tasks()
+        self.edepot_var.set(dep)
+        self.ever_var.set(str(ver))
+        self.ecrc_var.set(task.get("crc") or self._picker_crc(ver))
+        if task.get("filter") is not None:
+            self.efilter_var.set(task["filter"])
+        if not self.out_var.get().strip():
+            self.out_var.set(str(Path(self.dir_var.get().strip() or ".") / "extracted"))
+        if not task.get("download", True):
             self._run_extract()
             return
-        self._ensure_depot_rows(dep, lambda: self._start_pipeline(dep, int(v)))
+        self._start_pipeline(dep, ver)
 
     def _ensure_depot_rows(self, dep: str, cb):
         if self.depot_id == dep and self.depot_rows:
@@ -3176,7 +4519,7 @@ class App(tk.Tk):
                 cb()
             elif n > 180:
                 self._log("gave up waiting for the listing - check your connection")
-                self._batch_step()
+                self._task_step()
             else:
                 self.after(1000, lambda: wait(n + 1))
         wait()
@@ -3185,7 +4528,7 @@ class App(tk.Tk):
         rows = [r for r in self.depot_rows if r["version"] <= ver]
         if not rows:
             self._log(f"depot {dep} has no version {ver}")
-            self._batch_step()
+            self._task_step()
             return
         # prefer the torrent when it's connected and actually has these files
         if self.qb_use_var.get() and self.qb and self.qb_hash:
@@ -3195,9 +4538,9 @@ class App(tk.Tk):
         jobs = []
         for r in rows:
             for _crc, e in r["blobs"]:
-                jobs.append(self._job_for("blobs", e.name, e.size))
+                jobs.append(self._job_for("blobs", e.name, e.size, e.approx))
             for _crc, e in r["dats"]:
-                jobs.append(self._job_for("dats", e.name, e.size))
+                jobs.append(self._job_for("dats", e.name, e.size, e.approx))
         root = Path(self.dir_var.get().strip() or ".")
         if not self._find_extractor():
             jobs.append(self._job_for("extractor", "extract.exe", 1933312))
@@ -3207,10 +4550,10 @@ class App(tk.Tk):
 
         def present(j):
             p = root / j.rel
-            if p.exists() and (not j.size or p.stat().st_size == j.size):
+            if p.exists() and size_match(p.stat().st_size, j.size, j.approx):
                 return True
             q = elsewhere.get(Path(j.rel).name)
-            return bool(q) and (not j.size or q.stat().st_size == j.size)
+            return bool(q) and size_match(q.stat().st_size, j.size, j.approx)
 
         missing = [j for j in jobs if not present(j)]
         need = sum(j.size for j in missing)
@@ -3221,14 +4564,14 @@ class App(tk.Tk):
             self._run_extract()
             return
         if not self._space_ok(need):
-            self._batch_step()
+            self._task_step()
             return
         if not self._ask(f"Download {len(missing)} files ({human(need)}) for depot "
                          f"{dep}, then extract version {ver}?"):
-            self._batch_step()
+            self._task_step()
             return
         if not self._writable_save_dir():
-            self._batch_step()
+            self._task_step()
             return
         self._enqueue(missing)
         self.pipe = {"jobs": missing, "depot": dep, "version": ver}
@@ -3250,7 +4593,7 @@ class App(tk.Tk):
             for j in bad[:5]:
                 self._log(f"   {Path(j.rel).name}: {j.error or j.status}")
             self._log('Press "Retry failed" in the queue, then try again.')
-            self._batch_step()
+            self._task_step()
             return
         self._log("all files downloaded")
         self._run_extract()
@@ -3265,7 +4608,7 @@ class App(tk.Tk):
                 return
             self._enqueue([self._job_for("extractor", "extract.exe", 1933312)])
             self._start()
-            self._batch_step()
+            self._task_step()
             return
         if bdir is None or ddir is None:
             bdir, ddir = self._resolve_dirs(dep, int(v) if v.isdigit() else None)
@@ -3274,7 +4617,7 @@ class App(tk.Tk):
                       f"{self.dir_var.get().strip() or '.'}"
                       + (f" or {self._torrent_root()}" if self._torrent_root() else "")
                       + ' - use "Download + extract" to fetch what\'s missing')
-            self._batch_step()
+            self._task_step()
             return
         out_root = Path(self.out_var.get().strip() or (root / "extracted"))
         out_root.mkdir(parents=True, exist_ok=True)
@@ -3294,7 +4637,7 @@ class App(tk.Tk):
                         f"could be about that big, but only {human(free)} is free "
                         f"on {out_root.drive or out_root}.\n\nExtract anyway?"):
                     self._log("skipped - not enough free space for the output")
-                    self._batch_step()
+                    self._task_step()
                     return
         # The extractor strips every ':' from output paths - including the drive
         # letter - so an absolute --out silently becomes a relative one. Run it
@@ -3336,9 +4679,9 @@ class App(tk.Tk):
         else:
             self._log(f"extractor exited with code {rc} - see the messages above")
             self.status_var.set("extraction failed")
-        if not self._batch_running():
+        if not self._tasks_running():
             self.bell()                       # long jobs shouldn't need watching
-        self._batch_step()
+        self._task_step()
 
     def _remember_extract(self, nfiles: int):
         """Keep a note of what has been extracted, so the list can show it."""
@@ -3369,13 +4712,18 @@ class App(tk.Tk):
             os.system(f'xdg-open "{d}"')
 
     def _stop_extract(self):
+        """Stop whatever is running and drop the rest of the queue."""
         self.pipe = None
-        if self.batch or self.batch_total:
-            self._log(f"batch cancelled - {len(self.batch)} depot(s) not started")
-        self.batch, self.batch_total, self.batch_pending = [], 0, False
+        if self.tasks:
+            self._log(f"queue cleared - {len(self.tasks)} job(s) not started")
+        self.tasks, self.task_total, self.task_pending = [], 0, False
+        self.current_task = None
         if self.ext.busy:
             self.ext.kill()
             self._log("stopped.")
+        if self.proc_busy:                  # the queue holds both kinds of job
+            self._proc_stop_now()
+        self._render_tasks()
         self.btn_extract.config(state="normal")
 
     def _space_ok(self, need: int) -> bool:
@@ -3434,9 +4782,9 @@ class App(tk.Tk):
         jobs = []
         for r in rows:
             for _crc, e in r["blobs"]:
-                jobs.append(self._job_for("blobs", e.name, e.size))
+                jobs.append(self._job_for("blobs", e.name, e.size, e.approx))
             for _crc, e in r["dats"]:
-                jobs.append(self._job_for("dats", e.name, e.size))
+                jobs.append(self._job_for("dats", e.name, e.size, e.approx))
         if not jobs:
             return
         if not self._ask(f"Queue {len(jobs)} files "
@@ -3501,6 +4849,27 @@ class App(tk.Tk):
         keep = {str(id(j)) for j in self.dl.jobs}
         for iid in existing - keep:
             self.qtv.delete(iid)
+        self._apply_queue_sort()
+
+    def _sort_queue(self, col):
+        same = self.qsort[0] == col
+        self.qsort = (col, not self.qsort[1] if same else False)
+        self._apply_queue_sort()
+
+    def _apply_queue_sort(self):
+        """Reorder the rows in place. move() keeps each row's id, so the live
+        progress and speed updates keep landing on the right line."""
+        col, rev = self.qsort
+        if not col:
+            return                             # untouched: the order you added
+        key = {"name": lambda j: j.rel.lower(),
+               "size": lambda j: j.size,
+               "progress": lambda j: j.done / max(1, j.size),
+               "speed": lambda j: j.speed,
+               "status": lambda j: j.status}[col]
+        for pos, j in enumerate(sorted(self.dl.jobs, key=key, reverse=rev)):
+            if j.iid and self.qtv.exists(j.iid):
+                self.qtv.move(j.iid, "", pos)
 
     def _start(self):
         d = Path(self.dir_var.get().strip() or ".")
@@ -3569,10 +4938,12 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _restore_dates(self):
-        """Put the server's original timestamps back on the files you downloaded.
+        """Apply the timestamps recorded in the archive's *_dates.txt lists.
 
-        Only your own download folder is touched - the torrent folder is left
-        exactly as qBittorrent wrote it."""
+        These are not when the depot is from - they are how the files looked on
+        the content server when it was archived, and the uploader warns the dat
+        dates are the less trustworthy half. Only your own download folder is
+        touched; the torrent folder is left exactly as qBittorrent wrote it."""
         save = Path(self.dir_var.get().strip() or ".")
         lists = []
         for root in (save, self._torrent_root()):
@@ -3616,9 +4987,10 @@ class App(tk.Tk):
                 except OSError:
                     continue
             self.after(0, lambda: self.status_var.set(
-                f"restored the original date on {done:,} file(s)"
+                f"set the archive's recorded date on {done:,} file(s)"
                 + (f", {bad:,} could not be set" if bad else "")
-                + " (the torrent folder was not touched)"))
+                + " - these are archival dates, not release dates "
+                  "(the torrent folder was not touched)"))
         threading.Thread(target=work, daemon=True).start()
 
     def _unattended_tick(self):
@@ -3679,6 +5051,16 @@ class App(tk.Tk):
                 self.qtv.set(j.iid, "speed", human_speed(j.speed))
 
         total, done, speed, counts = self.dl.stats()
+        # learn the rates from what is actually happening, so estimates follow
+        # the mirror in use instead of a number baked in months ago
+        if speed > 0:
+            self.rate_agg = speed if not self.rate_agg else \
+                self.rate_agg * 0.7 + speed * 0.3
+            fastest = max((j.speed for j in jobs if j.status == STATUS_ACTIVE),
+                          default=0.0)
+            if fastest > 0:
+                self.rate_conn = fastest if not self.rate_conn else \
+                    max(self.rate_conn * 0.7 + fastest * 0.3, fastest)
         self.pbar["maximum"] = max(total, 1)
         self.pbar["value"] = done
         title = APP_NAME
@@ -3724,7 +5106,8 @@ class App(tk.Tk):
             pend = [j for j in self.dl.jobs if j.status not in (STATUS_DONE, STATUS_SKIP)]
             if pend:
                 QUEUE_PATH.write_text(json.dumps(
-                    [{"url": j.url, "rel": j.rel, "size": j.size, "sha256": j.sha256}
+                    [{"url": j.url, "rel": j.rel, "size": j.size,
+                      "sha256": j.sha256, "approx": j.approx}
                      for j in pend]), "utf-8")
             elif QUEUE_PATH.exists():
                 QUEUE_PATH.unlink()
@@ -3737,15 +5120,18 @@ class App(tk.Tk):
         except Exception:
             return
         jobs = [Job(url=d["url"], rel=d["rel"], size=d.get("size", 0),
-                    sha256=d.get("sha256", "")) for d in raw if d.get("url")]
+                    sha256=d.get("sha256", ""), approx=bool(d.get("approx")))
+                for d in raw if d.get("url")]
         if jobs:
             self.dl.add(jobs)
             self._sync_queue_rows()
             self.status_var.set(f"restored {len(jobs)} unfinished downloads - press Start")
 
     def _on_close(self):
-        # never leave a torrent paused because the app went away mid-mirror
-        if self.mirror_job and self.mirror_job.get("paused") and self.qb:
+        # never leave a torrent paused because the app went away mid-mirror -
+        # unless it was already stopped when we found it
+        if (self.mirror_job and self.mirror_job.get("paused") and self.qb
+                and self.mirror_job.get("was_running", True)):
             try:
                 self.qb.resume(self.qb_hash)
             except Exception:                                       # noqa: BLE001

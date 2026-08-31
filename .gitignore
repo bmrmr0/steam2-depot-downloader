@@ -4,6 +4,7 @@ s2extracted.json
 s2downloader.log
 s2downloader.log.*
 depot_names.json
+mirrors.json
 .s2cache/
 
 blobs/
